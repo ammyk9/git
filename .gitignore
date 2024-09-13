@@ -1,6 +1,7 @@
 /fuzz_corpora
 /GIT-BUILD-DIR
 /GIT-BUILD-OPTIONS
+/GIT-BUILT-FROM-COMMIT
 /GIT-CFLAGS
 /GIT-LDFLAGS
 /GIT-PREFIX
@@ -73,6 +74,7 @@
 /git-gc
 /git-get-tar-commit-id
 /git-grep
+/git-gvfs-helper
 /git-hash-object
 /git-help
 /git-hook
@@ -164,6 +166,7 @@
 /git-submodule
 /git-submodule--helper
 /git-subtree
+/git-survey
 /git-svn
 /git-switch
 /git-symbolic-ref
@@ -171,6 +174,7 @@
 /git-unpack-file
 /git-unpack-objects
 /git-update-index
+/git-update-microsoft-git
 /git-update-ref
 /git-update-server-info
 /git-upload-archive

@@ -702,6 +702,7 @@ test_expect_success 'pattern-checks: contained glob characters' '
 
 test_expect_success BSLASHPSPEC 'pattern-checks: escaped characters' '
 	git clone repo escaped &&
+	git -C escaped config advice.sparseIndexExpanded false &&
 	TREEOID=$(git -C escaped rev-parse HEAD:folder1) &&
 	NEWTREE=$(git -C escaped mktree <<-EOF
 	$(git -C escaped ls-tree HEAD)
@@ -782,6 +783,10 @@ test_expect_success 'cone mode clears ignored subdirectories' '
 
 	git -C repo status --porcelain=v2 >out &&
 	test_must_be_empty out &&
+
+	git -C repo -c index.deleteSparseDirectories=false sparse-checkout reapply &&
+	test_path_is_dir repo/folder1 &&
+	test_path_is_dir repo/deep/deeper2 &&
 
 	git -C repo sparse-checkout reapply &&
 	test_path_is_missing repo/folder1 &&
