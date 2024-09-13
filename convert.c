@@ -1,24 +1,15 @@
-#define USE_THE_REPOSITORY_VARIABLE
-
-#include "git-compat-util.h"
-#include "advice.h"
+#include "cache.h"
 #include "gvfs.h"
 #include "config.h"
-#include "convert.h"
-#include "copy.h"
-#include "gettext.h"
-#include "hex.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "attr.h"
 #include "run-command.h"
 #include "quote.h"
-#include "read-cache-ll.h"
 #include "sigchain.h"
 #include "pkt-line.h"
 #include "sub-process.h"
-#include "trace.h"
 #include "utf8.h"
-#include "merge-ll.h"
+#include "ll-merge.h"
 
 /*
  * convert.c - convert a file when checking it out and checking it in.
@@ -348,32 +339,30 @@ static int check_roundtrip(const char *enc_name)
 	 * space separated encodings (eg. "UTF-16, ASCII, CP1125").
 	 * Search for the given encoding in that string.
 	 */
-	const char *encoding = check_roundtrip_encoding ?
-		check_roundtrip_encoding : "SHIFT-JIS";
-	const char *found = strcasestr(encoding, enc_name);
+	const char *found = strcasestr(check_roundtrip_encoding, enc_name);
 	const char *next;
 	int len;
 	if (!found)
 		return 0;
 	next = found + strlen(enc_name);
-	len = strlen(encoding);
+	len = strlen(check_roundtrip_encoding);
 	return (found && (
 			/*
-			 * Check that the found encoding is at the beginning of
-			 * encoding or that it is prefixed with a space or
-			 * comma.
+			 * check that the found encoding is at the
+			 * beginning of check_roundtrip_encoding or
+			 * that it is prefixed with a space or comma
 			 */
-			found == encoding || (
+			found == check_roundtrip_encoding || (
 				(isspace(found[-1]) || found[-1] == ',')
 			)
 		) && (
 			/*
-			 * Check that the found encoding is at the end of
-			 * encoding or that it is suffixed with a space
-			 * or comma.
+			 * check that the found encoding is at the
+			 * end of check_roundtrip_encoding or
+			 * that it is suffixed with a space or comma
 			 */
-			next == encoding + len || (
-				next < encoding + len &&
+			next == check_roundtrip_encoding + len || (
+				next < check_roundtrip_encoding + len &&
 				(isspace(next[0]) || next[0] == ',')
 			)
 		));
@@ -637,28 +626,30 @@ struct filter_params {
 	const char *path;
 };
 
-static int filter_buffer_or_fd(int in UNUSED, int out, void *data)
+static int filter_buffer_or_fd(int in, int out, void *data)
 {
 	/*
 	 * Spawn cmd and feed the buffer contents through its stdin.
 	 */
 	struct child_process child_process = CHILD_PROCESS_INIT;
 	struct filter_params *params = (struct filter_params *)data;
-	const char *format = params->cmd;
 	int write_err, status;
 
 	/* apply % substitution to cmd */
 	struct strbuf cmd = STRBUF_INIT;
+	struct strbuf path = STRBUF_INIT;
+	struct strbuf_expand_dict_entry dict[] = {
+		{ "f", NULL, },
+		{ NULL, NULL, },
+	};
 
-	/* expand all %f with the quoted path; quote to preserve space, etc. */
-	while (strbuf_expand_step(&cmd, &format)) {
-		if (skip_prefix(format, "%", &format))
-			strbuf_addch(&cmd, '%');
-		else if (skip_prefix(format, "f", &format))
-			sq_quote_buf(&cmd, params->path);
-		else
-			strbuf_addch(&cmd, '%');
-	}
+	/* quote the path to preserve spaces, etc. */
+	sq_quote_buf(&path, params->path);
+	dict[0].value = path.buf;
+
+	/* expand all %f with the quoted path */
+	strbuf_expand(&cmd, params->cmd, strbuf_expand_dict_cb, &dict);
+	strbuf_release(&path);
 
 	strvec_push(&child_process.args, cmd.buf);
 	child_process.use_shell = 1;
@@ -993,9 +984,9 @@ done:
 static struct convert_driver {
 	const char *name;
 	struct convert_driver *next;
-	char *smudge;
-	char *clean;
-	char *process;
+	const char *smudge;
+	const char *clean;
+	const char *process;
 	int required;
 } *user_convert, **user_convert_tail;
 
@@ -1027,9 +1018,7 @@ static int apply_filter(const char *path, const char *src, size_t len,
 	return 0;
 }
 
-static int read_convert_config(const char *var, const char *value,
-			       const struct config_context *ctx UNUSED,
-			       void *cb UNUSED)
+static int read_convert_config(const char *var, const char *value, void *cb)
 {
 	const char *key, *name;
 	size_t namelen;
@@ -1042,7 +1031,7 @@ static int read_convert_config(const char *var, const char *value,
 	if (parse_config_key(var, "filter", &name, &namelen, &key) < 0 || !name)
 		return 0;
 	for (drv = user_convert; drv; drv = drv->next)
-		if (!xstrncmpz(drv->name, name, namelen))
+		if (!strncmp(drv->name, name, namelen) && !drv->name[namelen])
 			break;
 	if (!drv) {
 		CALLOC_ARRAY(drv, 1);
@@ -1576,7 +1565,7 @@ struct stream_filter {
 	struct stream_filter_vtbl *vtbl;
 };
 
-static int null_filter_fn(struct stream_filter *filter UNUSED,
+static int null_filter_fn(struct stream_filter *filter,
 			  const char *input, size_t *isize_p,
 			  char *output, size_t *osize_p)
 {
@@ -1595,7 +1584,7 @@ static int null_filter_fn(struct stream_filter *filter UNUSED,
 	return 0;
 }
 
-static void null_free_fn(struct stream_filter *filter UNUSED)
+static void null_free_fn(struct stream_filter *filter)
 {
 	; /* nothing -- null instances are shared */
 }

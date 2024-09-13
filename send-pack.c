@@ -1,27 +1,22 @@
-#define USE_THE_REPOSITORY_VARIABLE
-
-#include "git-compat-util.h"
+#include "builtin.h"
 #include "config.h"
 #include "commit.h"
-#include "date.h"
-#include "gettext.h"
-#include "hex.h"
+#include "refs.h"
 #include "gvfs.h"
-#include "object-store-ll.h"
+#include "object-store.h"
 #include "pkt-line.h"
 #include "sideband.h"
 #include "run-command.h"
 #include "remote.h"
 #include "connect.h"
 #include "send-pack.h"
+#include "quote.h"
 #include "transport.h"
 #include "version.h"
 #include "oid-array.h"
 #include "gpg-interface.h"
+#include "cache.h"
 #include "shallow.h"
-#include "parse-options.h"
-#include "trace2.h"
-#include "write-or-die.h"
 
 int option_parse_push_signed(const struct option *opt,
 			     const char *arg, int unset)
@@ -45,12 +40,22 @@ int option_parse_push_signed(const struct option *opt,
 	die("bad %s argument: %s", opt->long_name, arg);
 }
 
+static int config_use_sideband = 1;
+
+static int send_pack_config(const char *var, const char *value, void *unused)
+{
+	if (!strcmp("sendpack.sideband", var))
+		config_use_sideband = git_config_bool(var, value);
+
+	return 0;
+}
+
 static void feed_object(const struct object_id *oid, FILE *fh, int negative)
 {
 	if (negative && !gvfs_config_is_set(GVFS_MISSING_OK) &&
-	    !repo_has_object_file_with_flags(the_repository, oid,
-					     OBJECT_INFO_SKIP_FETCH_OBJECT |
-					     OBJECT_INFO_QUICK))
+	    !has_object_file_with_flags(oid,
+					OBJECT_INFO_SKIP_FETCH_OBJECT |
+					OBJECT_INFO_QUICK))
 		return;
 
 	if (negative)
@@ -90,8 +95,6 @@ static int pack_objects(int fd, struct ref *refs, struct oid_array *advertised,
 		strvec_push(&po.args, "--progress");
 	if (is_repository_shallow(the_repository))
 		strvec_push(&po.args, "--shallow");
-	if (args->disable_bitmaps)
-		strvec_push(&po.args, "--no-use-bitmap-index");
 	po.in = -1;
 	po.out = args->stateless_rpc ? -1 : fd;
 	po.git_cmd = 1;
@@ -262,7 +265,7 @@ static int receive_status(struct packet_reader *reader, struct ref *refs)
 			if (p)
 				hint->remote_status = xstrdup(p);
 			else
-				hint->remote_status = xstrdup("failed");
+				hint->remote_status = "failed";
 		} else {
 			hint->status = REF_STATUS_OK;
 			hint->remote_status = xstrdup_or_null(p);
@@ -272,7 +275,7 @@ static int receive_status(struct packet_reader *reader, struct ref *refs)
 	return ret;
 }
 
-static int sideband_demux(int in UNUSED, int out, void *data)
+static int sideband_demux(int in, int out, void *data)
 {
 	int *fd = data, ret;
 	if (async_with_fork())
@@ -428,25 +431,16 @@ static void get_commons_through_negotiation(const char *url,
 	struct child_process child = CHILD_PROCESS_INIT;
 	const struct ref *ref;
 	int len = the_hash_algo->hexsz + 1; /* hash + NL */
-	int nr_negotiation_tip = 0;
 
 	child.git_cmd = 1;
 	child.no_stdin = 1;
 	child.out = -1;
 	strvec_pushl(&child.args, "fetch", "--negotiate-only", NULL);
 	for (ref = remote_refs; ref; ref = ref->next) {
-		if (!is_null_oid(&ref->new_oid)) {
-			strvec_pushf(&child.args, "--negotiation-tip=%s",
-				     oid_to_hex(&ref->new_oid));
-			nr_negotiation_tip++;
-		}
+		if (!is_null_oid(&ref->new_oid))
+			strvec_pushf(&child.args, "--negotiation-tip=%s", oid_to_hex(&ref->new_oid));
 	}
 	strvec_push(&child.args, url);
-
-	if (!nr_negotiation_tip) {
-		child_process_clear(&child);
-		return;
-	}
 
 	if (start_command(&child))
 		die(_("send-pack: unable to fork off fetch subprocess"));
@@ -489,7 +483,7 @@ int send_pack(struct send_pack_args *args,
 	int need_pack_data = 0;
 	int allow_deleting_refs = 0;
 	int status_report = 0;
-	int use_sideband = 1;
+	int use_sideband = 0;
 	int quiet_supported = 0;
 	int agent_supported = 0;
 	int advertise_sid = 0;
@@ -504,7 +498,6 @@ int send_pack(struct send_pack_args *args,
 	struct async demux;
 	const char *push_cert_nonce = NULL;
 	struct packet_reader reader;
-	int use_bitmaps;
 
 	if (!remote_refs) {
 		fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
@@ -512,13 +505,11 @@ int send_pack(struct send_pack_args *args,
 		return 0;
 	}
 
-	git_config_get_bool("sendpack.sideband", &use_sideband);
+	git_config(send_pack_config, NULL);
+
 	git_config_get_bool("push.negotiate", &push_negotiate);
 	if (push_negotiate)
 		get_commons_through_negotiation(args->url, remote_refs, &commons);
-
-	if (!git_config_get_bool("push.usebitmaps", &use_bitmaps))
-		args->disable_bitmaps = !use_bitmaps;
 
 	git_config_get_bool("transfer.advertisesid", &advertise_sid);
 
@@ -531,7 +522,8 @@ int send_pack(struct send_pack_args *args,
 		allow_deleting_refs = 1;
 	if (server_supports("ofs-delta"))
 		args->use_ofs_delta = 1;
-	use_sideband = use_sideband && server_supports("side-band-64k");
+	if (config_use_sideband && server_supports("side-band-64k"))
+		use_sideband = 1;
 	if (server_supports("quiet"))
 		quiet_supported = 1;
 	if (server_supports("agent"))
@@ -549,7 +541,7 @@ int send_pack(struct send_pack_args *args,
 		die(_("the receiving end does not support this repository's hash algorithm"));
 
 	if (args->push_cert != SEND_PACK_PUSH_CERT_NEVER) {
-		size_t len;
+		int len;
 		push_cert_nonce = server_feature_value("push-cert", &len);
 		if (push_cert_nonce) {
 			reject_invalid_nonce(push_cert_nonce, len);

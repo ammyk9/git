@@ -12,8 +12,8 @@ In addition to the Git command-line interface (CLI), `microsoft/git` includes th
 further enable working with extremely large repositories. Scalar is a tool to apply the latest
 recommendations and use the most advanced Git features. You can read
 [the Scalar CLI documentation](Documentation/scalar.txt) or read our
-[Scalar user guide](contrib/scalar/docs/index.md) including
-[the philosophy of Scalar](contrib/scalar/docs/philosophy.md).
+[Scalar user guide](Documentation/scalar/index.md) including
+[the philosophy of Scalar](Documentation/scalar/philosophy.md).
 
 If you encounter problems with `microsoft/git`, please report them as
 [GitHub issues](https://github.com/microsoft/git/issues).
@@ -38,7 +38,7 @@ One major feature that Scalar recommends is [partial clone](https://github.blog/
 which reduces the amount of data transferred in order to work with a Git repository. While several
 services such as GitHub support partial clone, Azure Repos instead has an older version of this
 functionality called
-[the GVFS protocol](https://github.com/microsoft/VFSForGit/blob/HEAD/Protocol.md).
+[the GVFS protocol](https://docs.microsoft.com/en-us/azure/devops/learn/git/gvfs-architecture#gvfs-protocol).
 The integration with the GVFS protocol present in `microsoft/git` is not appropriate to include in
 the core Git client because partial clone is the official version of that functionality.
 
@@ -114,61 +114,13 @@ Or you can run the `git update-microsoft-git` command, which will run those brew
 ## Linux
 ### Ubuntu/Debian distributions
 
-On newer distributions*, you can install using the most recent Debian package.
-To download and validate the signature of this package, run the following:
+On newer distributions*, you may use the most recent
+[Debian package](https://github.com/microsoft/git/releases). For
+example, you can download a specific version as follows:
 
 ```shell
-# Install needed packages
-sudo apt-get install -y curl debsig-verify
-
-# Download public key signature file
-curl -s https://api.github.com/repos/microsoft/git/releases/latest \
-| grep -E 'browser_download_url.*msft-git-public.asc' \
-| cut -d : -f 2,3 \
-| tr -d \" \
-| xargs -I 'url' curl -L -o msft-git-public.asc 'url'
-
-# De-armor public key signature file
-gpg --output msft-git-public.gpg --dearmor msft-git-public.asc
-
-# Note that the fingerprint of this key is "B8F12E25441124E1", which you can
-# determine by running:
-gpg --show-keys msft-git-public.asc | head -n 2 | tail -n 1 | tail -c 17
-
-# Copy de-armored public key to debsig keyring folder
-sudo mkdir /usr/share/debsig/keyrings/B8F12E25441124E1
-sudo mv msft-git-public.gpg /usr/share/debsig/keyrings/B8F12E25441124E1/
-
-# Create an appropriate policy file
-sudo mkdir /etc/debsig/policies/B8F12E25441124E1
-cat > generic.pol << EOL
-<?xml version="1.0"?>
-<!DOCTYPE Policy SYSTEM "https://www.debian.org/debsig/1.0/policy.dtd">
-<Policy xmlns="https://www.debian.org/debsig/1.0/">
-  <Origin Name="Microsoft Git" id="B8F12E25441124E1" Description="Microsoft Git public key"/>
-  <Selection>
-    <Required Type="origin" File="msft-git-public.gpg" id="B8F12E25441124E1"/>
-  </Selection>
-  <Verification MinOptional="0">
-    <Required Type="origin" File="msft-git-public.gpg" id="B8F12E25441124E1"/>
-  </Verification>
-</Policy>
-EOL
-
-sudo mv generic.pol /etc/debsig/policies/B8F12E25441124E1/generic.pol
-
-# Download Debian package
-curl -s https://api.github.com/repos/microsoft/git/releases/latest \
-| grep "browser_download_url.*deb" \
-| cut -d : -f 2,3 \
-| tr -d \" \
-| xargs -I 'url' curl -L -o msft-git.deb 'url'
-
-# Verify
-debsig-verify msft-git.deb
-
-# Install
-sudo dpkg -i msft-git.deb
+wget -O microsoft-git.deb https://github.com/microsoft/git/releases/download/v2.33.0.vfs.0.0/microsoft-git_2.33.0.vfs.0.0.deb
+sudo dpkg -i microsoft-git.deb
 ```
 
 Double-check that you have the right version by running these commands,
@@ -183,13 +135,13 @@ To upgrade, you will need to repeat these steps to reinstall.
 
 *Older distributions are missing some required dependencies. Even
 though the package may appear to install successfully, `microsoft/
-git` will not function as expected. If you are running `Ubuntu 20.04` or
+git` will not function as expected. If you are running Ubuntu 18.04 or
 older, please follow the install from source instructions below
 instead of installing the debian package.
 
-### Installing From Source
+### Other distributions
 
-On older or other distros you will need to compile and install `microsoft/git` from source:
+You will need to compile and install `microsoft/git` from source:
 
 ```shell
 git clone https://github.com/microsoft/git microsoft-git
@@ -200,14 +152,6 @@ sudo make -j12 prefix=/usr/local install
 
 For more assistance building Git from source, see
 [the INSTALL file in the core Git project](https://github.com/git/git/blob/master/INSTALL).
-
-#### Common Debian based dependencies
-While the INSTALL file covers dependencies in detail, here is a shortlist of common required dependencies on older Debian/Ubuntu distros:
-
-```shell
-sudo apt-get update
-sudo apt-get install libz-dev libssl-dev libcurl4-gnutls-dev libexpat1-dev gettext cmake gcc
-```
 
 Contributing
 =========================================================

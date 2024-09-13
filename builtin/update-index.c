@@ -3,33 +3,23 @@
  *
  * Copyright (C) Linus Torvalds, 2005
  */
-
-#include "builtin.h"
+#define USE_THE_INDEX_COMPATIBILITY_MACROS
+#include "cache.h"
 #include "gvfs.h"
 #include "bulk-checkin.h"
 #include "config.h"
-#include "environment.h"
-#include "gettext.h"
-#include "hash.h"
-#include "hex.h"
 #include "lockfile.h"
 #include "quote.h"
 #include "cache-tree.h"
 #include "tree-walk.h"
-#include "object-file.h"
+#include "builtin.h"
 #include "refs.h"
 #include "resolve-undo.h"
 #include "parse-options.h"
 #include "pathspec.h"
 #include "dir.h"
-#include "read-cache.h"
-#include "repository.h"
-#include "setup.h"
-#include "sparse-index.h"
 #include "split-index.h"
-#include "symlinks.h"
 #include "fsmonitor.h"
-#include "write-or-die.h"
 
 /*
  * Default to not allowing changes to the list of files. The
@@ -248,16 +238,16 @@ done:
 static int mark_ce_flags(const char *path, int flag, int mark)
 {
 	int namelen = strlen(path);
-	int pos = index_name_pos(the_repository->index, path, namelen);
+	int pos = cache_name_pos(path, namelen);
 	if (0 <= pos) {
-		mark_fsmonitor_invalid(the_repository->index, the_repository->index->cache[pos]);
+		mark_fsmonitor_invalid(&the_index, active_cache[pos]);
 		if (mark)
-			the_repository->index->cache[pos]->ce_flags |= flag;
+			active_cache[pos]->ce_flags |= flag;
 		else
-			the_repository->index->cache[pos]->ce_flags &= ~flag;
-		the_repository->index->cache[pos]->ce_flags |= CE_UPDATE_IN_BASE;
-		cache_tree_invalidate_path(the_repository->index, path);
-		the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
+			active_cache[pos]->ce_flags &= ~flag;
+		active_cache[pos]->ce_flags |= CE_UPDATE_IN_BASE;
+		cache_tree_invalidate_path(&the_index, path);
+		active_cache_changed |= CE_ENTRY_CHANGED;
 		return 0;
 	}
 	return -1;
@@ -267,7 +257,7 @@ static int remove_one_path(const char *path)
 {
 	if (!allow_remove)
 		return error("%s: does not exist and --remove not passed", path);
-	if (remove_file_from_index(the_repository->index, path))
+	if (remove_file_from_cache(path))
 		return error("%s: cannot remove from the index", path);
 	return 0;
 }
@@ -292,24 +282,24 @@ static int add_one_path(const struct cache_entry *old, const char *path, int len
 	struct cache_entry *ce;
 
 	/* Was the old index entry already up-to-date? */
-	if (old && !ce_stage(old) && !ie_match_stat(the_repository->index, old, st, 0))
+	if (old && !ce_stage(old) && !ce_match_stat(old, st, 0))
 		return 0;
 
-	ce = make_empty_cache_entry(the_repository->index, len);
+	ce = make_empty_cache_entry(&the_index, len);
 	memcpy(ce->name, path, len);
 	ce->ce_flags = create_ce_flags(0);
 	ce->ce_namelen = len;
-	fill_stat_cache_info(the_repository->index, ce, st);
+	fill_stat_cache_info(&the_index, ce, st);
 	ce->ce_mode = ce_mode_from_stat(old, st->st_mode);
 
-	if (index_path(the_repository->index, &ce->oid, path, st,
+	if (index_path(&the_index, &ce->oid, path, st,
 		       info_only ? 0 : HASH_WRITE_OBJECT)) {
 		discard_cache_entry(ce);
 		return -1;
 	}
 	option = allow_add ? ADD_CACHE_OK_TO_ADD : 0;
 	option |= allow_replace ? ADD_CACHE_OK_TO_REPLACE : 0;
-	if (add_index_entry(the_repository->index, ce, option)) {
+	if (add_cache_entry(ce, option)) {
 		discard_cache_entry(ce);
 		return error("%s: cannot add to the index - missing --add option?", path);
 	}
@@ -342,16 +332,15 @@ static int add_one_path(const struct cache_entry *old, const char *path, int len
 static int process_directory(const char *path, int len, struct stat *st)
 {
 	struct object_id oid;
-	int pos = index_name_pos(the_repository->index, path, len);
+	int pos = cache_name_pos(path, len);
 
 	/* Exact match: file or existing gitlink */
 	if (pos >= 0) {
-		const struct cache_entry *ce = the_repository->index->cache[pos];
+		const struct cache_entry *ce = active_cache[pos];
 		if (S_ISGITLINK(ce->ce_mode)) {
 
 			/* Do nothing to the index if there is no HEAD! */
-			if (repo_resolve_gitlink_ref(the_repository, path,
-						     "HEAD", &oid) < 0)
+			if (resolve_gitlink_ref(path, "HEAD", &oid) < 0)
 				return 0;
 
 			return add_one_path(ce, path, len, st);
@@ -362,8 +351,8 @@ static int process_directory(const char *path, int len, struct stat *st)
 
 	/* Inexact match: is there perhaps a subdirectory match? */
 	pos = -pos-1;
-	while (pos < the_repository->index->cache_nr) {
-		const struct cache_entry *ce = the_repository->index->cache[pos++];
+	while (pos < active_nr) {
+		const struct cache_entry *ce = active_cache[pos++];
 
 		if (strncmp(ce->name, path, len))
 			break;
@@ -377,7 +366,7 @@ static int process_directory(const char *path, int len, struct stat *st)
 	}
 
 	/* No match - should we add it as a gitlink? */
-	if (!repo_resolve_gitlink_ref(the_repository, path, "HEAD", &oid))
+	if (!resolve_gitlink_ref(path, "HEAD", &oid))
 		return add_one_path(NULL, path, len, st);
 
 	/* Error out. */
@@ -393,8 +382,8 @@ static int process_path(const char *path, struct stat *st, int stat_errno)
 	if (has_symlink_leading_path(path, len))
 		return error("'%s' is beyond a symbolic link", path);
 
-	pos = index_name_pos(the_repository->index, path, len);
-	ce = pos < 0 ? NULL : the_repository->index->cache[pos];
+	pos = cache_name_pos(path, len);
+	ce = pos < 0 ? NULL : active_cache[pos];
 	if (ce && ce_skip_worktree(ce)) {
 		/*
 		 * working directory version is assumed "good"
@@ -402,7 +391,7 @@ static int process_path(const char *path, struct stat *st, int stat_errno)
 		 * On the other hand, removing it from index should work
 		 */
 		if (!ignore_skip_worktree_entries && allow_remove &&
-		    remove_file_from_index(the_repository->index, path))
+		    remove_file_from_cache(path))
 			return error("%s: cannot remove from the index", path);
 		return 0;
 	}
@@ -430,7 +419,7 @@ static int add_cacheinfo(unsigned int mode, const struct object_id *oid,
 		return error("Invalid path '%s'", path);
 
 	len = strlen(path);
-	ce = make_empty_cache_entry(the_repository->index, len);
+	ce = make_empty_cache_entry(&the_index, len);
 
 	oidcpy(&ce->oid, oid);
 	memcpy(ce->name, path, len);
@@ -441,7 +430,7 @@ static int add_cacheinfo(unsigned int mode, const struct object_id *oid,
 		ce->ce_flags |= CE_VALID;
 	option = allow_add ? ADD_CACHE_OK_TO_ADD : 0;
 	option |= allow_replace ? ADD_CACHE_OK_TO_REPLACE : 0;
-	if (add_index_entry(the_repository->index, ce, option))
+	if (add_cache_entry(ce, option))
 		return error("%s: cannot add to the index - missing --add option?",
 			     path);
 	report("add '%s'", path);
@@ -453,11 +442,11 @@ static void chmod_path(char flip, const char *path)
 	int pos;
 	struct cache_entry *ce;
 
-	pos = index_name_pos(the_repository->index, path, strlen(path));
+	pos = cache_name_pos(path, strlen(path));
 	if (pos < 0)
 		goto fail;
-	ce = the_repository->index->cache[pos];
-	if (chmod_index_entry(the_repository->index, ce, flip) < 0)
+	ce = active_cache[pos];
+	if (chmod_cache_entry(ce, flip) < 0)
 		goto fail;
 
 	report("chmod %cx '%s'", flip, path);
@@ -500,7 +489,7 @@ static void update_one(const char *path)
 	}
 
 	if (force_remove) {
-		if (remove_file_from_index(the_repository->index, path))
+		if (remove_file_from_cache(path))
 			die("git update-index: unable to remove %s", path);
 		report("remove '%s'", path);
 		return;
@@ -583,7 +572,7 @@ static void read_index_info(int nul_term_line)
 
 		if (!mode) {
 			/* mode == 0 means there is no such path -- remove */
-			if (remove_file_from_index(the_repository->index, path_name))
+			if (remove_file_from_cache(path_name))
 				die("git update-index: unable to remove %s",
 				    ptr);
 		}
@@ -611,6 +600,9 @@ static const char * const update_index_usage[] = {
 	NULL
 };
 
+static struct object_id head_oid;
+static struct object_id merge_head_oid;
+
 static struct cache_entry *read_one_ent(const char *which,
 					struct object_id *ent, const char *path,
 					int namelen, int stage)
@@ -624,12 +616,12 @@ static struct cache_entry *read_one_ent(const char *which,
 			error("%s: not in %s branch.", path, which);
 		return NULL;
 	}
-	if (!the_repository->index->sparse_index && mode == S_IFDIR) {
+	if (!the_index.sparse_index && mode == S_IFDIR) {
 		if (which)
 			error("%s: not a blob in %s branch.", path, which);
 		return NULL;
 	}
-	ce = make_empty_cache_entry(the_repository->index, namelen);
+	ce = make_empty_cache_entry(&the_index, namelen);
 
 	oidcpy(&ce->oid, &oid);
 	memcpy(ce->name, path, namelen);
@@ -641,17 +633,84 @@ static struct cache_entry *read_one_ent(const char *which,
 
 static int unresolve_one(const char *path)
 {
-	struct string_list_item *item;
-	int res = 0;
+	int namelen = strlen(path);
+	int pos;
+	int ret = 0;
+	struct cache_entry *ce_2 = NULL, *ce_3 = NULL;
 
-	if (!the_repository->index->resolve_undo)
-		return res;
-	item = string_list_lookup(the_repository->index->resolve_undo, path);
-	if (!item)
-		return res; /* no resolve-undo record for the path */
-	res = unmerge_index_entry(the_repository->index, path, item->util, 0);
-	FREE_AND_NULL(item->util);
-	return res;
+	/* See if there is such entry in the index. */
+	pos = cache_name_pos(path, namelen);
+	if (0 <= pos) {
+		/* already merged */
+		pos = unmerge_cache_entry_at(pos);
+		if (pos < active_nr) {
+			const struct cache_entry *ce = active_cache[pos];
+			if (ce_stage(ce) &&
+			    ce_namelen(ce) == namelen &&
+			    !memcmp(ce->name, path, namelen))
+				return 0;
+		}
+		/* no resolve-undo information; fall back */
+	} else {
+		/* If there isn't, either it is unmerged, or
+		 * resolved as "removed" by mistake.  We do not
+		 * want to do anything in the former case.
+		 */
+		pos = -pos-1;
+		if (pos < active_nr) {
+			const struct cache_entry *ce = active_cache[pos];
+			if (ce_namelen(ce) == namelen &&
+			    !memcmp(ce->name, path, namelen)) {
+				fprintf(stderr,
+					"%s: skipping still unmerged path.\n",
+					path);
+				goto free_return;
+			}
+		}
+	}
+
+	/* Grab blobs from given path from HEAD and MERGE_HEAD,
+	 * stuff HEAD version in stage #2,
+	 * stuff MERGE_HEAD version in stage #3.
+	 */
+	ce_2 = read_one_ent("our", &head_oid, path, namelen, 2);
+	ce_3 = read_one_ent("their", &merge_head_oid, path, namelen, 3);
+
+	if (!ce_2 || !ce_3) {
+		ret = -1;
+		goto free_return;
+	}
+	if (oideq(&ce_2->oid, &ce_3->oid) &&
+	    ce_2->ce_mode == ce_3->ce_mode) {
+		fprintf(stderr, "%s: identical in both, skipping.\n",
+			path);
+		goto free_return;
+	}
+
+	remove_file_from_cache(path);
+	if (add_cache_entry(ce_2, ADD_CACHE_OK_TO_ADD)) {
+		error("%s: cannot add our version to the index.", path);
+		ret = -1;
+		goto free_return;
+	}
+	if (!add_cache_entry(ce_3, ADD_CACHE_OK_TO_ADD))
+		return 0;
+	error("%s: cannot add their version to the index.", path);
+	ret = -1;
+ free_return:
+	discard_cache_entry(ce_2);
+	discard_cache_entry(ce_3);
+	return ret;
+}
+
+static void read_head_pointers(void)
+{
+	if (read_ref("HEAD", &head_oid))
+		die("No HEAD -- no initial commit yet?");
+	if (read_ref("MERGE_HEAD", &merge_head_oid)) {
+		fprintf(stderr, "Not in the middle of a merge.\n");
+		exit(0);
+	}
 }
 
 static int do_unresolve(int ac, const char **av,
@@ -659,6 +718,11 @@ static int do_unresolve(int ac, const char **av,
 {
 	int i;
 	int err = 0;
+
+	/* Read HEAD and MERGE_HEAD; if MERGE_HEAD does not exist, we
+	 * are not doing a merge, so exit with success status.
+	 */
+	read_head_pointers();
 
 	for (i = 1; i < ac; i++) {
 		const char *arg = av[i];
@@ -669,7 +733,7 @@ static int do_unresolve(int ac, const char **av,
 	return err;
 }
 
-static int do_reupdate(const char **paths,
+static int do_reupdate(int ac, const char **av,
 		       const char *prefix)
 {
 	/* Read HEAD and run update-index on paths that are
@@ -678,25 +742,24 @@ static int do_reupdate(const char **paths,
 	int pos;
 	int has_head = 1;
 	struct pathspec pathspec;
-	struct object_id head_oid;
 
 	parse_pathspec(&pathspec, 0,
 		       PATHSPEC_PREFER_CWD,
-		       prefix, paths);
+		       prefix, av + 1);
 
-	if (refs_read_ref(get_main_ref_store(the_repository), "HEAD", &head_oid))
+	if (read_ref("HEAD", &head_oid))
 		/* If there is no HEAD, that means it is an initial
 		 * commit.  Update everything in the index.
 		 */
 		has_head = 0;
  redo:
-	for (pos = 0; pos < the_repository->index->cache_nr; pos++) {
-		const struct cache_entry *ce = the_repository->index->cache[pos];
+	for (pos = 0; pos < active_nr; pos++) {
+		const struct cache_entry *ce = active_cache[pos];
 		struct cache_entry *old = NULL;
 		int save_nr;
 		char *path;
 
-		if (ce_stage(ce) || !ce_path_match(the_repository->index, ce, &pathspec, NULL))
+		if (ce_stage(ce) || !ce_path_match(&the_index, ce, &pathspec, NULL))
 			continue;
 		if (has_head)
 			old = read_one_ent(NULL, &head_oid,
@@ -712,7 +775,7 @@ static int do_reupdate(const char **paths,
 		 * to process each path individually
 		 */
 		if (S_ISSPARSEDIR(ce->ce_mode)) {
-			ensure_full_index(the_repository->index);
+			ensure_full_index(&the_index);
 			goto redo;
 		}
 
@@ -720,12 +783,12 @@ static int do_reupdate(const char **paths,
 		 * path anymore, in which case, under 'allow_remove',
 		 * or worse yet 'allow_replace', active_nr may decrease.
 		 */
-		save_nr = the_repository->index->cache_nr;
+		save_nr = active_nr;
 		path = xstrdup(ce->name);
 		update_one(path);
 		free(path);
 		discard_cache_entry(old);
-		if (save_nr != the_repository->index->cache_nr)
+		if (save_nr != active_nr)
 			goto redo;
 	}
 	clear_pathspec(&pathspec);
@@ -740,19 +803,18 @@ struct refresh_params {
 static int refresh(struct refresh_params *o, unsigned int flag)
 {
 	setup_work_tree();
-	repo_read_index(the_repository);
-	*o->has_errors |= refresh_index(the_repository->index, o->flags | flag, NULL,
-					NULL, NULL);
-	if (has_racy_timestamp(the_repository->index)) {
+	read_cache();
+	*o->has_errors |= refresh_cache(o->flags | flag);
+	if (has_racy_timestamp(&the_index)) {
 		/*
 		 * Even if nothing else has changed, updating the file
 		 * increases the chance that racy timestamps become
 		 * non-racy, helping future run-time performance.
 		 * We do that even in case of "errors" returned by
-		 * refresh_index() as these are no actual errors.
+		 * refresh_cache() as these are no actual errors.
 		 * cmd_status() does the same.
 		 */
-		the_repository->index->cache_changed |= SOMETHING_CHANGED;
+		active_cache_changed |= SOMETHING_CHANGED;
 	}
 	return 0;
 }
@@ -784,12 +846,12 @@ static int chmod_callback(const struct option *opt,
 	return 0;
 }
 
-static int resolve_undo_clear_callback(const struct option *opt UNUSED,
+static int resolve_undo_clear_callback(const struct option *opt,
 				const char *arg, int unset)
 {
 	BUG_ON_OPT_NEG(unset);
 	BUG_ON_OPT_ARG(arg);
-	resolve_undo_clear_index(the_repository->index);
+	resolve_undo_clear();
 	return 0;
 }
 
@@ -818,7 +880,7 @@ static int parse_new_style_cacheinfo(const char *arg,
 }
 
 static enum parse_opt_result cacheinfo_callback(
-	struct parse_opt_ctx_t *ctx, const struct option *opt UNUSED,
+	struct parse_opt_ctx_t *ctx, const struct option *opt,
 	const char *arg, int unset)
 {
 	struct object_id oid;
@@ -890,7 +952,7 @@ static enum parse_opt_result unresolve_callback(
 	*has_errors = do_unresolve(ctx->argc, ctx->argv,
 				prefix, prefix ? strlen(prefix) : 0);
 	if (*has_errors)
-		the_repository->index->cache_changed = 0;
+		active_cache_changed = 0;
 
 	ctx->argv += ctx->argc - 1;
 	ctx->argc = 1;
@@ -909,9 +971,9 @@ static enum parse_opt_result reupdate_callback(
 
 	/* consume remaining arguments. */
 	setup_work_tree();
-	*has_errors = do_reupdate(ctx->argv + 1, prefix);
+	*has_errors = do_reupdate(ctx->argc, ctx->argv, prefix);
 	if (*has_errors)
-		the_repository->index->cache_changed = 0;
+		active_cache_changed = 0;
 
 	ctx->argv += ctx->argc - 1;
 	ctx->argc = 1;
@@ -1018,8 +1080,6 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 			resolve_undo_clear_callback),
 		OPT_INTEGER(0, "index-version", &preferred_index_format,
 			N_("write index in this format")),
-		OPT_SET_INT(0, "show-index-version", &preferred_index_format,
-			    N_("report on-disk index format version"), -1),
 		OPT_BOOL(0, "split-index", &split_index,
 			N_("enable or disable split index")),
 		OPT_BOOL(0, "untracked-cache", &untracked_cache,
@@ -1050,15 +1110,15 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 	the_repository->settings.command_requires_full_index = 0;
 
 	/* we will diagnose later if it turns out that we need to update it */
-	newfd = repo_hold_locked_index(the_repository, &lock_file, 0);
+	newfd = hold_locked_index(&lock_file, 0);
 	if (newfd < 0)
 		lock_error = errno;
 
-	entries = repo_read_index(the_repository);
+	entries = read_cache();
 	if (entries < 0)
 		die("cache corrupted");
 
-	the_repository->index->updated_skipworktree = 1;
+	the_index.updated_skipworktree = 1;
 
 	/*
 	 * Custom copy of parse_options() because we want to handle
@@ -1118,20 +1178,15 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 		if (preferred_index_format != 4 && gvfs_config_is_set(GVFS_BLOCK_COMMANDS))
 			die(_("changing the index version is not supported on a GVFS repo"));
 
-		if (preferred_index_format < 0) {
-			printf(_("%d\n"), the_repository->index->version);
-		} else if (preferred_index_format < INDEX_FORMAT_LB ||
-			   INDEX_FORMAT_UB < preferred_index_format) {
+		if (preferred_index_format < INDEX_FORMAT_LB ||
+		    INDEX_FORMAT_UB < preferred_index_format)
 			die("index-version %d not in range: %d..%d",
 			    preferred_index_format,
 			    INDEX_FORMAT_LB, INDEX_FORMAT_UB);
-		} else {
-			if (the_repository->index->version != preferred_index_format)
-				the_repository->index->cache_changed |= SOMETHING_CHANGED;
-			report(_("index-version: was %d, set to %d"),
-			       the_repository->index->version, preferred_index_format);
-			the_repository->index->version = preferred_index_format;
-		}
+
+		if (the_index.version != preferred_index_format)
+			active_cache_changed |= SOMETHING_CHANGED;
+		the_index.version = preferred_index_format;
 	}
 
 	if (read_from_stdin) {
@@ -1170,16 +1225,16 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 			warning(_("core.splitIndex is set to false; "
 				  "remove or change it, if you really want to "
 				  "enable split index"));
-		if (the_repository->index->split_index)
-			the_repository->index->cache_changed |= SPLIT_INDEX_ORDERED;
+		if (the_index.split_index)
+			the_index.cache_changed |= SPLIT_INDEX_ORDERED;
 		else
-			add_split_index(the_repository->index);
+			add_split_index(&the_index);
 	} else if (!split_index) {
 		if (git_config_get_split_index() == 1)
 			warning(_("core.splitIndex is set to true; "
 				  "remove or change it, if you really want to "
 				  "disable split index"));
-		remove_split_index(the_repository->index);
+		remove_split_index(&the_index);
 	}
 
 	prepare_repo_settings(r);
@@ -1191,7 +1246,7 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 			warning(_("core.untrackedCache is set to true; "
 				  "remove or change it, if you really want to "
 				  "disable the untracked cache"));
-		remove_untracked_cache(the_repository->index);
+		remove_untracked_cache(&the_index);
 		report(_("Untracked cache disabled"));
 		break;
 	case UC_TEST:
@@ -1203,7 +1258,7 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 			warning(_("core.untrackedCache is set to false; "
 				  "remove or change it, if you really want to "
 				  "enable the untracked cache"));
-		add_untracked_cache(the_repository->index);
+		add_untracked_cache(&the_index);
 		report(_("Untracked cache enabled for '%s'"), get_git_work_tree());
 		break;
 	default:
@@ -1233,7 +1288,7 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 				"set it if you really want to "
 				"enable fsmonitor"));
 		}
-		add_fsmonitor(the_repository->index);
+		add_fsmonitor(&the_index);
 		report(_("fsmonitor enabled"));
 	} else if (!fsmonitor) {
 		enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
@@ -1241,17 +1296,17 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 			warning(_("core.fsmonitor is set; "
 				"remove it if you really want to "
 				"disable fsmonitor"));
-		remove_fsmonitor(the_repository->index);
+		remove_fsmonitor(&the_index);
 		report(_("fsmonitor disabled"));
 	}
 
-	if (the_repository->index->cache_changed || force_write) {
+	if (active_cache_changed || force_write) {
 		if (newfd < 0) {
 			if (refresh_args.flags & REFRESH_QUIET)
 				exit(128);
 			unable_to_lock_die(get_index_file(), lock_error);
 		}
-		if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
+		if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
 			die("Unable to write new index file");
 	}
 

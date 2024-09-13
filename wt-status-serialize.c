@@ -1,14 +1,6 @@
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "environment.h"
-#include "hex.h"
-#include "repository.h"
+#include "cache.h"
 #include "wt-status.h"
 #include "pkt-line.h"
-#include "trace.h"
-#include "read-cache-ll.h"
-#include "path.h"
-#include "trace2.h"
 
 static struct trace_key trace_serialize = TRACE_KEY_INIT(SERIALIZE);
 

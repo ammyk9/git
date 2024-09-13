@@ -12,10 +12,13 @@
  */
 static int platform_specific_upgrade(void)
 {
-	struct child_process cp = CHILD_PROCESS_INIT;
+	int res;
+	struct strvec args = STRVEC_INIT;
 
-	strvec_push(&cp.args, "git-update-git-for-windows");
-	return run_command(&cp);
+	strvec_push(&args, "git-update-git-for-windows");
+	res = run_command_v_opt(args.v, 0);
+	strvec_clear(&args);
+	return res;
 }
 #elif defined(__APPLE__)
 /*
@@ -30,13 +33,13 @@ static int platform_specific_upgrade(void)
 static int platform_specific_upgrade(void)
 {
 	int res;
-	struct child_process update = CHILD_PROCESS_INIT;
-	struct child_process upgrade = CHILD_PROCESS_INIT;
+	struct strvec args = STRVEC_INIT;
 
 	printf("Updating Homebrew with 'brew update'\n");
 
-	strvec_pushl(&update.args, "brew", "update", NULL);
-	res = run_command(&update);
+	strvec_pushl(&args, "brew", "update", NULL);
+	res = run_command_v_opt(args.v, 0);
+	strvec_clear(&args);
 
 	if (res) {
 		error(_("'brew update' failed; is brew installed?"));
@@ -44,8 +47,9 @@ static int platform_specific_upgrade(void)
 	}
 
 	printf("Upgrading microsoft-git with 'brew upgrade --cask microsoft-git'\n");
-	strvec_pushl(&upgrade.args, "brew", "upgrade", "--cask", "microsoft-git", NULL);
-	res = run_command(&upgrade);
+	strvec_pushl(&args, "brew", "upgrade", "--cask", "microsoft-git", NULL);
+	res = run_command_v_opt(args.v, 0);
+	strvec_clear(&args);
 
 	return res;
 }

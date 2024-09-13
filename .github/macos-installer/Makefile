@@ -7,33 +7,28 @@ LD_LIBRARY_PATH := /usr/lib
 OSX_VERSION := $(shell sw_vers -productVersion)
 TARGET_FLAGS := -mmacosx-version-min=$(OSX_VERSION) -DMACOSX_DEPLOYMENT_TARGET=$(OSX_VERSION)
 
-uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
+ARCH := x86_64
+ARCH_CODE := x86_64
+ARCH_FLAGS_x86_64 := -arch x86_64
 
-ARCH_UNIV := universal
-ARCH_FLAGS := -arch x86_64 -arch arm64
-
-CFLAGS := $(TARGET_FLAGS) $(ARCH_FLAGS)
-LDFLAGS := $(TARGET_FLAGS) $(ARCH_FLAGS)
+CFLAGS := $(TARGET_FLAGS) $(ARCH_FLAGS_${ARCH_CODE})
+LDFLAGS := $(TARGET_FLAGS) $(ARCH_FLAGS_${ARCH_CODE})
 
 PREFIX := /usr/local
 GIT_PREFIX := $(PREFIX)/git
 
+BUILD_CODE := intel-$(ARCH_CODE)
 BUILD_DIR := $(GITHUB_WORKSPACE)/payload
-DESTDIR := $(PWD)/stage/git-$(ARCH_UNIV)-$(VERSION)
-ARTIFACTDIR := build-artifacts
+DESTDIR := $(PWD)/stage/git-$(BUILD_CODE)-$(VERSION)
+ARTIFACTDIR := build_artifacts
 SUBMAKE := $(MAKE) C_INCLUDE_PATH="$(C_INCLUDE_PATH)" CPLUS_INCLUDE_PATH="$(CPLUS_INCLUDE_PATH)" LD_LIBRARY_PATH="$(LD_LIBRARY_PATH)" TARGET_FLAGS="$(TARGET_FLAGS)" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" NO_GETTEXT=1 NO_DARWIN_PORTS=1 prefix=$(GIT_PREFIX) GIT_BUILT_FROM_COMMIT="$(GIT_BUILT_FROM_COMMIT)" DESTDIR=$(DESTDIR)
 CORES := $(shell bash -c "sysctl hw.ncpu | awk '{print \$$2}'")
 
-# Guard against environment variables
-APPLE_APP_IDENTITY =
-APPLE_INSTALLER_IDENTITY =
-APPLE_KEYCHAIN_PROFILE =
-
-.PHONY: image pkg payload codesign notarize
+.PHONY: image pkg payload
 
 .SECONDARY:
 
-$(DESTDIR)$(GIT_PREFIX)/VERSION-$(VERSION)-$(ARCH_UNIV):
+$(DESTDIR)$(GIT_PREFIX)/VERSION-$(VERSION)-$(BUILD_CODE):
 	rm -f $(BUILD_DIR)/git-$(VERSION)/osx-installed*
 	mkdir -p $(DESTDIR)$(GIT_PREFIX)
 	touch $@
@@ -45,20 +40,6 @@ $(BUILD_DIR)/git-$(VERSION)/osx-built-keychain:
 $(BUILD_DIR)/git-$(VERSION)/osx-built:
 	[ -d $(DESTDIR)$(GIT_PREFIX) ] && $(SUDO) rm -rf $(DESTDIR) || echo ok
 	cd $(BUILD_DIR)/git-$(VERSION); $(SUBMAKE) -j $(CORES) all strip
-	echo "================"
-	echo "Dumping Linkage"
-	cd $(BUILD_DIR)/git-$(VERSION); ./git version
-	echo "===="
-	cd $(BUILD_DIR)/git-$(VERSION); /usr/bin/otool -L ./git
-	echo "===="
-	cd $(BUILD_DIR)/git-$(VERSION); /usr/bin/otool -L ./git-http-fetch
-	echo "===="
-	cd $(BUILD_DIR)/git-$(VERSION); /usr/bin/otool -L ./git-http-push
-	echo "===="
-	cd $(BUILD_DIR)/git-$(VERSION); /usr/bin/otool -L ./git-remote-http
-	echo "===="
-	cd $(BUILD_DIR)/git-$(VERSION); /usr/bin/otool -L ./git-gvfs-helper
-	echo "================"
 	touch $@
 
 $(BUILD_DIR)/git-$(VERSION)/osx-installed-bin: $(BUILD_DIR)/git-$(VERSION)/osx-built $(BUILD_DIR)/git-$(VERSION)/osx-built-keychain
@@ -100,58 +81,36 @@ symlinks:
 	ruby ../scripts/symlink-git-hardlinks.rb $(ARTIFACTDIR)
 	touch $@
 
-$(BUILD_DIR)/git-$(VERSION)/osx-installed: $(DESTDIR)$(GIT_PREFIX)/VERSION-$(VERSION)-$(ARCH_UNIV) $(BUILD_DIR)/git-$(VERSION)/osx-installed-man $(BUILD_DIR)/git-$(VERSION)/osx-installed-assets $(BUILD_DIR)/git-$(VERSION)/osx-installed-subtree
+$(BUILD_DIR)/git-$(VERSION)/osx-installed: $(DESTDIR)$(GIT_PREFIX)/VERSION-$(VERSION)-$(BUILD_CODE) $(BUILD_DIR)/git-$(VERSION)/osx-installed-man $(BUILD_DIR)/git-$(VERSION)/osx-installed-assets $(BUILD_DIR)/git-$(VERSION)/osx-installed-subtree
 	find $(DESTDIR)$(GIT_PREFIX) -type d -exec chmod ugo+rx {} \;
 	find $(DESTDIR)$(GIT_PREFIX) -type f -exec chmod ugo+r {} \;
 	touch $@
 
-$(BUILD_DIR)/git-$(VERSION)/osx-built-assert-$(ARCH_UNIV): $(BUILD_DIR)/git-$(VERSION)/osx-built
+$(BUILD_DIR)/git-$(VERSION)/osx-built-assert-$(ARCH_CODE): $(BUILD_DIR)/git-$(VERSION)/osx-built
+ifeq ("$(ARCH_CODE)", "universal")
 	File $(BUILD_DIR)/git-$(VERSION)/git
 	File $(BUILD_DIR)/git-$(VERSION)/contrib/credential/osxkeychain/git-credential-osxkeychain
+else
+	[ "$$(File $(BUILD_DIR)/git-$(VERSION)/git | cut -f 5 -d' ')" == "$(ARCH_CODE)" ]
+	[ "$$(File $(BUILD_DIR)/git-$(VERSION)/contrib/credential/osxkeychain/git-credential-osxkeychain | cut -f 5 -d' ')" == "$(ARCH_CODE)" ]
+endif
 	touch $@
 
-disk-image/VERSION-$(VERSION)-$(ARCH_UNIV):
+disk-image/VERSION-$(VERSION)-$(ARCH_CODE):
 	rm -f disk-image/*.pkg disk-image/VERSION-* disk-image/.DS_Store
 	mkdir disk-image
 	touch "$@"
 
-pkg_cmd := pkgbuild --identifier com.git.pkg --version $(VERSION) \
-	--root $(ARTIFACTDIR)$(PREFIX) --scripts assets/scripts \
-	--install-location $(PREFIX) --component-plist ./assets/git-components.plist
+disk-image/git-$(VERSION)-$(BUILD_CODE).pkg: disk-image/VERSION-$(VERSION)-$(ARCH_CODE) symlinks
+	pkgbuild --identifier com.git.pkg --version $(VERSION) --root $(ARTIFACTDIR)$(PREFIX) --scripts assets/scripts --install-location $(PREFIX) --component-plist ./assets/git-components.plist disk-image/git-$(VERSION)-$(BUILD_CODE).pkg
 
-ifdef APPLE_INSTALLER_IDENTITY
-	pkg_cmd += --sign "$(APPLE_INSTALLER_IDENTITY)"
-endif
+git-%-$(BUILD_CODE).dmg:
+	hdiutil create git-$(VERSION)-$(BUILD_CODE).uncompressed.dmg -fs HFS+ -srcfolder disk-image -volname "Git $(VERSION) Intel $(ARCH)" -ov
+	hdiutil convert -format UDZO -o $@ git-$(VERSION)-$(BUILD_CODE).uncompressed.dmg
+	rm -f git-$(VERSION)-$(BUILD_CODE).uncompressed.dmg
 
-pkg_cmd += disk-image/git-$(VERSION)-$(ARCH_UNIV).pkg
-disk-image/git-$(VERSION)-$(ARCH_UNIV).pkg: disk-image/VERSION-$(VERSION)-$(ARCH_UNIV) symlinks
-	$(pkg_cmd)
+payload: $(BUILD_DIR)/git-$(VERSION)/osx-installed $(BUILD_DIR)/git-$(VERSION)/osx-built-assert-$(ARCH_CODE)
 
-git-%-$(ARCH_UNIV).dmg:
-	hdiutil create git-$(VERSION)-$(ARCH_UNIV).uncompressed.dmg -fs HFS+ -srcfolder disk-image -volname "Git $(VERSION) $(ARCH_UNIV)" -ov 2>&1 | tee err || { \
-		grep "Resource busy" err && \
-		sleep 5 && \
-		hdiutil create git-$(VERSION)-$(ARCH_UNIV).uncompressed.dmg -fs HFS+ -srcfolder disk-image -volname "Git $(VERSION) $(ARCH_UNIV)" -ov; }
-	hdiutil convert -format UDZO -o $@ git-$(VERSION)-$(ARCH_UNIV).uncompressed.dmg
-	rm -f git-$(VERSION)-$(ARCH_UNIV).uncompressed.dmg
+pkg: disk-image/git-$(VERSION)-$(BUILD_CODE).pkg
 
-payload: $(BUILD_DIR)/git-$(VERSION)/osx-installed $(BUILD_DIR)/git-$(VERSION)/osx-built-assert-$(ARCH_UNIV)
-
-pkg: disk-image/git-$(VERSION)-$(ARCH_UNIV).pkg
-
-image: git-$(VERSION)-$(ARCH_UNIV).dmg
-
-ifdef APPLE_APP_IDENTITY
-codesign:
-	@$(CURDIR)/../scripts/codesign.sh --payload="build-artifacts/usr/local/git" \
-		--identity="$(APPLE_APP_IDENTITY)" \
-		--entitlements="$(CURDIR)/entitlements.xml"
-endif
-
-# Notarization can only happen if the package is fully signed
-ifdef APPLE_KEYCHAIN_PROFILE
-notarize:
-	@$(CURDIR)/../scripts/notarize.sh \
-		--package="disk-image/git-$(VERSION)-$(ARCH_UNIV).pkg" \
-		--keychain-profile="$(APPLE_KEYCHAIN_PROFILE)"
-endif
+image: git-$(VERSION)-$(BUILD_CODE).dmg

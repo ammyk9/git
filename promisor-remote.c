@@ -1,18 +1,10 @@
-#define USE_THE_REPOSITORY_VARIABLE
-
-#include "git-compat-util.h"
-#include "environment.h"
-#include "gettext.h"
-#include "hex.h"
-#include "object-store-ll.h"
+#include "cache.h"
+#include "object-store.h"
 #include "gvfs-helper-client.h"
 #include "promisor-remote.h"
 #include "config.h"
-#include "trace2.h"
 #include "transport.h"
 #include "strvec.h"
-#include "packfile.h"
-#include "environment.h"
 
 struct promisor_remote_config {
 	struct promisor_remote *promisors;
@@ -27,16 +19,6 @@ static int fetch_objects(struct repository *repo,
 	struct child_process child = CHILD_PROCESS_INIT;
 	int i;
 	FILE *child_in;
-	int quiet;
-
-	if (git_env_bool(NO_LAZY_FETCH_ENVIRONMENT, 0)) {
-		static int warning_shown;
-		if (!warning_shown) {
-			warning_shown = 1;
-			warning(_("lazy fetching disabled; some objects may not be available"));
-		}
-		return -1;
-	}
 
 	child.git_cmd = 1;
 	child.in = -1;
@@ -46,8 +28,6 @@ static int fetch_objects(struct repository *repo,
 		     "fetch", remote_name, "--no-tags",
 		     "--no-write-fetch-head", "--recurse-submodules=no",
 		     "--filter=blob:none", "--stdin", NULL);
-	if (!git_config_get_bool("promisor.quiet", &quiet) && quiet)
-		strvec_push(&child.args, "--quiet");
 	if (start_command(&child))
 		die(_("promisor-remote: unable to fork off fetch subprocess"));
 	child_in = xfdopen(child.in, "w");
@@ -117,9 +97,7 @@ static void promisor_remote_move_to_tail(struct promisor_remote_config *config,
 	config->promisors_tail = &r->next;
 }
 
-static int promisor_remote_config(const char *var, const char *value,
-				  const struct config_context *ctx UNUSED,
-				  void *data)
+static int promisor_remote_config(const char *var, const char *value, void *data)
 {
 	struct promisor_remote_config *config = data;
 	const char *name;
@@ -169,7 +147,7 @@ static void promisor_remote_init(struct repository *r)
 	if (r->promisor_remote_config)
 		return;
 	config = r->promisor_remote_config =
-		xcalloc(1, sizeof(*r->promisor_remote_config));
+		xcalloc(sizeof(*r->promisor_remote_config), 1);
 	config->promisors_tail = &config->promisors;
 
 	repo_config(r, promisor_remote_config, config);
@@ -253,26 +231,24 @@ static int remove_fetched_oids(struct repository *repo,
 	return remaining_nr;
 }
 
-void promisor_remote_get_direct(struct repository *repo,
-				const struct object_id *oids,
-				int oid_nr)
+int promisor_remote_get_direct(struct repository *repo,
+			       const struct object_id *oids,
+			       int oid_nr)
 {
 	struct promisor_remote *r;
 	struct object_id *remaining_oids = (struct object_id *)oids;
 	int remaining_nr = oid_nr;
 	int to_free = 0;
-	int i;
+	int res = -1;
 
 	if (oid_nr == 0)
-		return;
+		return 0;
 	if (core_use_gvfs_helper) {
 		enum gh_client__created ghc = GHC__CREATED__NOTHING;
 
 		trace2_data_intmax("bug", the_repository, "fetch_objects/gvfs-helper", oid_nr);
 		gh_client__queue_oid_array(oids, oid_nr);
-		if (!gh_client__drain_queue(&ghc))
-			return;
-		die(_("failed to fetch missing objects from the remote"));
+		return gh_client__drain_queue(&ghc);
 	}
 
 	promisor_remote_init(repo);
@@ -288,16 +264,12 @@ void promisor_remote_get_direct(struct repository *repo,
 				continue;
 			}
 		}
-		goto all_fetched;
+		res = 0;
+		break;
 	}
 
-	for (i = 0; i < remaining_nr; i++) {
-		if (is_promisor_object(&remaining_oids[i]))
-			die(_("could not fetch %s from promisor remote"),
-			    oid_to_hex(&remaining_oids[i]));
-	}
-
-all_fetched:
 	if (to_free)
 		free(remaining_oids);
+
+	return res;
 }

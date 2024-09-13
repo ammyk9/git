@@ -100,6 +100,11 @@ operates on a single commit.
   a remote with many branches. Any `git fetch` commands after the clone will
   still ask for all branches.
 
+* `--no-prefetch`: Use this option to not prefetch commits after clone. This
+  is not recommended for anyone planning to use their clone for history
+  traversal. Use of this option will make commands like `git log` or
+  `git pull` extremely slow and is therefore not recommended.
+
 Removing a Scalar Clone
 -----------------------
 

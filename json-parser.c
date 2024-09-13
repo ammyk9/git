@@ -1,5 +1,4 @@
-#include "git-compat-util.h"
-#include "hex.h"
+#include "cache.h"
 #include "json-parser.h"
 
 static int reset_iterator(struct json_iterator *it)

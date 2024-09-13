@@ -2,32 +2,39 @@
  * The Scalar command-line interface.
  */
 
-#define USE_THE_REPOSITORY_VARIABLE
-
-#include "git-compat-util.h"
-#include "abspath.h"
+#include "cache.h"
 #include "gettext.h"
-#include "hex.h"
 #include "parse-options.h"
 #include "config.h"
 #include "run-command.h"
-#include "simple-ipc.h"
-#include "fsmonitor-ipc.h"
-#include "fsmonitor-settings.h"
 #include "refs.h"
 #include "dir.h"
-#include "object-file.h"
 #include "packfile.h"
 #include "help.h"
-#include "setup.h"
-#include "wrapper.h"
-#include "trace2.h"
+#include "archive.h"
+#include "object-store.h"
+#include "simple-ipc.h"
+#include "fsmonitor-ipc.h"
 #include "json-parser.h"
 #include "remote.h"
-#include "path.h"
 
 static int is_unattended(void) {
 	return git_env_bool("Scalar_UNATTENDED", 0);
+}
+
+/*
+ * Remove the deepest subdirectory in the provided path string. Path must not
+ * include a trailing path separator. Returns 1 if parent directory found,
+ * otherwise 0.
+ */
+static int strbuf_parent_directory(struct strbuf *buf)
+{
+	size_t len = buf->len;
+	size_t offset = offset_1st_component(buf->buf);
+	char *path_sep = find_last_dir_sep(buf->buf + offset);
+	strbuf_setlen(buf, path_sep ? path_sep - buf->buf : offset);
+
+	return buf->len < len;
 }
 
 static void setup_enlistment_directory(int argc, const char **argv,
@@ -36,8 +43,8 @@ static void setup_enlistment_directory(int argc, const char **argv,
 				       struct strbuf *enlistment_root)
 {
 	struct strbuf path = STRBUF_INIT;
-	int enlistment_is_repo_parent = 0;
-	size_t len;
+	char *root;
+	int enlistment_found = 0;
 
 	if (startup_info->have_repository)
 		BUG("gitdir already set up?!?");
@@ -50,8 +57,6 @@ static void setup_enlistment_directory(int argc, const char **argv,
 		strbuf_add_absolute_path(&path, argv[0]);
 		if (!is_directory(path.buf))
 			die(_("'%s' does not exist"), path.buf);
-		if (chdir(path.buf) < 0)
-			die_errno(_("could not switch to '%s'"), path.buf);
 	} else if (strbuf_getcwd(&path) < 0)
 		die(_("need a working directory"));
 
@@ -59,41 +64,57 @@ static void setup_enlistment_directory(int argc, const char **argv,
 #ifdef GIT_WINDOWS_NATIVE
 	convert_slashes(path.buf);
 #endif
+	do {
+		const size_t len = path.len;
 
-	/* check if currently in enlistment root with src/ workdir */
-	len = path.len;
-	strbuf_addstr(&path, "/src");
-	if (is_nonbare_repository_dir(&path)) {
-		enlistment_is_repo_parent = 1;
-		if (chdir(path.buf) < 0)
-			die_errno(_("could not switch to '%s'"), path.buf);
-	}
-	strbuf_setlen(&path, len);
+		/* check if currently in enlistment root with src/ workdir */
+		strbuf_addstr(&path, "/src");
+		if (is_nonbare_repository_dir(&path)) {
+			if (enlistment_root)
+				strbuf_add(enlistment_root, path.buf, len);
 
-	setup_git_directory();
+			enlistment_found = 1;
+			break;
+		}
 
-	if (!the_repository->worktree)
-		die(_("Scalar enlistments require a worktree"));
+		/* reset to original path */
+		strbuf_setlen(&path, len);
 
-	if (enlistment_root) {
-		if (enlistment_is_repo_parent)
-			strbuf_addbuf(enlistment_root, &path);
-		else
-			strbuf_addstr(enlistment_root, the_repository->worktree);
-	}
+		/* check if currently in workdir */
+		if (is_nonbare_repository_dir(&path)) {
+			if (enlistment_root) {
+				/*
+				 * If the worktree's directory's name is `src`, the enlistment is the
+				 * parent directory, otherwise it is identical to the worktree.
+				 */
+				root = strip_path_suffix(path.buf, "src");
+				strbuf_addstr(enlistment_root, root ? root : path.buf);
+				free(root);
+			}
+
+			enlistment_found = 1;
+			break;
+		}
+	} while (strbuf_parent_directory(&path));
+
+	if (!enlistment_found)
+		die(_("could not find enlistment root"));
+
+	if (chdir(path.buf) < 0)
+		die_errno(_("could not switch to '%s'"), path.buf);
 
 	strbuf_release(&path);
+	setup_git_directory();
 }
 
 static int git_retries = 3;
 
-LAST_ARG_MUST_BE_NULL
 static int run_git(const char *arg, ...)
 {
+	struct strvec argv = STRVEC_INIT;
 	va_list args;
 	const char *p;
-	struct strvec argv = STRVEC_INIT;
-	int res = 0, attempts;
+	int res, attempts;
 
 	va_start(args, arg);
 	strvec_push(&argv, arg);
@@ -103,13 +124,8 @@ static int run_git(const char *arg, ...)
 
 	for (attempts = 0, res = 1;
 	     res && attempts < git_retries;
-	     attempts++) {
-		struct child_process cmd = CHILD_PROCESS_INIT;
-
-		cmd.git_cmd = 1;
-		strvec_pushv(&cmd.args, argv.v);
-		res = run_command(&cmd);
-	}
+	     attempts++)
+		res = run_command_v_opt(argv.v, RUN_GIT_CMD);
 
 	strvec_clear(&argv);
 	return res;
@@ -128,39 +144,13 @@ static const char *ensure_absolute_path(const char *path, char **absolute)
 	return *absolute;
 }
 
-struct scalar_config {
-	const char *key;
-	const char *value;
-	int overwrite_on_reconfigure;
-};
-
-static int set_scalar_config(const struct scalar_config *config, int reconfigure)
-{
-	char *value = NULL;
-	int res;
-
-	if ((reconfigure && config->overwrite_on_reconfigure) ||
-	    git_config_get_string(config->key, &value)) {
-		trace2_data_string("scalar", the_repository, config->key, "created");
-		res = git_config_set_gently(config->key, config->value);
-	} else {
-		trace2_data_string("scalar", the_repository, config->key, "exists");
-		res = 0;
-	}
-
-	free(value);
-	return res;
-}
-
-static int have_fsmonitor_support(void)
-{
-	return fsmonitor_ipc__is_supported() &&
-	       fsm_settings__get_reason(the_repository) == FSMONITOR_REASON_OK;
-}
-
 static int set_recommended_config(int reconfigure)
 {
-	struct scalar_config config[] = {
+	struct {
+		const char *key;
+		const char *value;
+		int overwrite_on_reconfigure;
+	} config[] = {
 		/* Required */
 		{ "am.keepCR", "true", 1 },
 		{ "core.FSCache", "true", 1 },
@@ -172,7 +162,6 @@ static int set_recommended_config(int reconfigure)
 		{ "credential.validate", "false", 1 }, /* GCM4W-only */
 		{ "gc.auto", "0", 1 },
 		{ "gui.GCWarning", "false", 1 },
-		{ "index.skipHash", "false", 1 },
 		{ "index.threads", "true", 1 },
 		{ "index.version", "4", 1 },
 		{ "merge.stat", "false", 1 },
@@ -193,6 +182,12 @@ static int set_recommended_config(int reconfigure)
 		{ "core.autoCRLF", "false" },
 		{ "core.safeCRLF", "false" },
 		{ "fetch.showForcedUpdates", "false" },
+#ifdef HAVE_FSMONITOR_DAEMON_BACKEND
+		/*
+		 * Enable the built-in FSMonitor on supported platforms.
+		 */
+		{ "core.fsmonitor", "true" },
+#endif
 		{ "core.configWriteLockTimeoutMS", "150" },
 		{ NULL, NULL },
 	};
@@ -217,16 +212,17 @@ static int set_recommended_config(int reconfigure)
 	}
 
 	for (i = 0; config[i].key; i++) {
-		if (set_scalar_config(config + i, reconfigure))
-			return error(_("could not configure %s=%s"),
-				     config[i].key, config[i].value);
-	}
-
-	if (have_fsmonitor_support()) {
-		struct scalar_config fsmonitor = { "core.fsmonitor", "true" };
-		if (set_scalar_config(&fsmonitor, reconfigure))
-			return error(_("could not configure %s=%s"),
-				     fsmonitor.key, fsmonitor.value);
+		if ((reconfigure && config[i].overwrite_on_reconfigure) ||
+		    git_config_get_string(config[i].key, &value)) {
+			trace2_data_string("scalar", the_repository, config[i].key, "created");
+			if (git_config_set_gently(config[i].key,
+						  config[i].value) < 0)
+				return error(_("could not configure %s=%s"),
+					     config[i].key, config[i].value);
+		} else {
+			trace2_data_string("scalar", the_repository, config[i].key, "exists");
+			free(value);
+		}
 	}
 
 	/*
@@ -257,10 +253,7 @@ static int toggle_maintenance(int enable)
 	if (git_config_get_ulong("core.configWriteLockTimeoutMS", &ul))
 		git_config_push_parameter("core.configWriteLockTimeoutMS=150");
 
-	return run_git("maintenance",
-		       enable ? "start" : "unregister",
-		       enable ? NULL : "--force",
-		       NULL);
+	return run_git("maintenance", enable ? "start" : "unregister", NULL);
 }
 
 static int add_or_remove_enlistment(int add)
@@ -291,57 +284,180 @@ static int add_or_remove_enlistment(int add)
 
 static int start_fsmonitor_daemon(void)
 {
-	assert(have_fsmonitor_support());
+#ifdef HAVE_FSMONITOR_DAEMON_BACKEND
+	struct strbuf err = STRBUF_INIT;
+	struct child_process cp = CHILD_PROCESS_INIT;
 
-	if (fsmonitor_ipc__get_state() != IPC_STATE__LISTENING)
-		return run_git("fsmonitor--daemon", "start", NULL);
+	cp.git_cmd = 1;
+	strvec_pushl(&cp.args, "fsmonitor--daemon", "start", NULL);
+	if (!pipe_command(&cp, NULL, 0, NULL, 0, &err, 0)) {
+		strbuf_release(&err);
+		return 0;
+	}
+
+	if (fsmonitor_ipc__get_state() != IPC_STATE__LISTENING) {
+		write_in_full(2, err.buf, err.len);
+		strbuf_release(&err);
+		return error(_("could not start the FSMonitor daemon"));
+	}
+
+	strbuf_release(&err);
+#endif
 
 	return 0;
 }
 
 static int stop_fsmonitor_daemon(void)
 {
-	assert(have_fsmonitor_support());
+#ifdef HAVE_FSMONITOR_DAEMON_BACKEND
+	struct strbuf err = STRBUF_INIT;
+	struct child_process cp = CHILD_PROCESS_INIT;
 
-	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
-		return run_git("fsmonitor--daemon", "stop", NULL);
+	cp.git_cmd = 1;
+	strvec_pushl(&cp.args, "fsmonitor--daemon", "stop", NULL);
+	if (!pipe_command(&cp, NULL, 0, NULL, 0, &err, 0)) {
+		strbuf_release(&err);
+		return 0;
+	}
+
+	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
+		write_in_full(2, err.buf, err.len);
+		strbuf_release(&err);
+		return error(_("could not stop the FSMonitor daemon"));
+	}
+
+	strbuf_release(&err);
+#endif
 
 	return 0;
 }
 
 static int register_dir(void)
 {
-	if (add_or_remove_enlistment(1))
-		return error(_("could not add enlistment"));
+	int res = add_or_remove_enlistment(1);
 
-	if (set_recommended_config(0))
-		return error(_("could not set recommended config"));
+	if (!res)
+		res = set_recommended_config(0);
 
-	if (toggle_maintenance(1))
-		warning(_("could not turn on maintenance"));
+	if (!res)
+		res = toggle_maintenance(1);
 
-	if (have_fsmonitor_support() && start_fsmonitor_daemon()) {
-		return error(_("could not start the FSMonitor daemon"));
-	}
+	if (!res)
+		res = start_fsmonitor_daemon();
 
-	return 0;
+	return res;
 }
 
 static int unregister_dir(void)
 {
 	int res = 0;
 
-	if (toggle_maintenance(0))
-		res = error(_("could not turn off maintenance"));
+	if (toggle_maintenance(0) < 0)
+		res = -1;
 
-	if (add_or_remove_enlistment(0))
-		res = error(_("could not remove enlistment"));
+	if (add_or_remove_enlistment(0) < 0)
+		res = -1;
+
+	if (stop_fsmonitor_daemon() < 0)
+		res = -1;
 
 	return res;
 }
 
+static int add_directory_to_archiver(struct strvec *archiver_args,
+					  const char *path, int recurse)
+{
+	int at_root = !*path;
+	DIR *dir = opendir(at_root ? "." : path);
+	struct dirent *e;
+	struct strbuf buf = STRBUF_INIT;
+	size_t len;
+	int res = 0;
+
+	if (!dir)
+		return error_errno(_("could not open directory '%s'"), path);
+
+	if (!at_root)
+		strbuf_addf(&buf, "%s/", path);
+	len = buf.len;
+	strvec_pushf(archiver_args, "--prefix=%s", buf.buf);
+
+	while (!res && (e = readdir(dir))) {
+		if (!strcmp(".", e->d_name) || !strcmp("..", e->d_name))
+			continue;
+
+		strbuf_setlen(&buf, len);
+		strbuf_addstr(&buf, e->d_name);
+
+		if (e->d_type == DT_REG)
+			strvec_pushf(archiver_args, "--add-file=%s", buf.buf);
+		else if (e->d_type != DT_DIR)
+			warning(_("skipping '%s', which is neither file nor "
+				  "directory"), buf.buf);
+		else if (recurse &&
+			 add_directory_to_archiver(archiver_args,
+						   buf.buf, recurse) < 0)
+			res = -1;
+	}
+
+	closedir(dir);
+	strbuf_release(&buf);
+	return res;
+}
+
+#ifndef WIN32
+#include <sys/statvfs.h>
+#endif
+
+static int get_disk_info(struct strbuf *out)
+{
+#ifdef WIN32
+	struct strbuf buf = STRBUF_INIT;
+	char volume_name[MAX_PATH], fs_name[MAX_PATH];
+	DWORD serial_number, component_length, flags;
+	ULARGE_INTEGER avail2caller, total, avail;
+
+	strbuf_realpath(&buf, ".", 1);
+	if (!GetDiskFreeSpaceExA(buf.buf, &avail2caller, &total, &avail)) {
+		error(_("could not determine free disk size for '%s'"),
+		      buf.buf);
+		strbuf_release(&buf);
+		return -1;
+	}
+
+	strbuf_setlen(&buf, offset_1st_component(buf.buf));
+	if (!GetVolumeInformationA(buf.buf, volume_name, sizeof(volume_name),
+				   &serial_number, &component_length, &flags,
+				   fs_name, sizeof(fs_name))) {
+		error(_("could not get info for '%s'"), buf.buf);
+		strbuf_release(&buf);
+		return -1;
+	}
+	strbuf_addf(out, "Available space on '%s': ", buf.buf);
+	strbuf_humanise_bytes(out, avail2caller.QuadPart);
+	strbuf_addch(out, '\n');
+	strbuf_release(&buf);
+#else
+	struct strbuf buf = STRBUF_INIT;
+	struct statvfs stat;
+
+	strbuf_realpath(&buf, ".", 1);
+	if (statvfs(buf.buf, &stat) < 0) {
+		error_errno(_("could not determine free disk size for '%s'"),
+			    buf.buf);
+		strbuf_release(&buf);
+		return -1;
+	}
+
+	strbuf_addf(out, "Available space on '%s': ", buf.buf);
+	strbuf_humanise_bytes(out, st_mult(stat.f_bsize, stat.f_bavail));
+	strbuf_addf(out, " (mount flags 0x%lx)\n", stat.f_flag);
+	strbuf_release(&buf);
+#endif
+	return 0;
+}
+
 /* printf-style interface, expects `<key>=<value>` argument */
-__attribute__((format (printf, 1, 2)))
 static int set_config(const char *fmt, ...)
 {
 	struct strbuf buf = STRBUF_INIT;
@@ -481,13 +597,8 @@ static char *default_cache_root(const char *root)
 {
 	const char *env;
 
-	if (is_unattended()) {
-		struct strbuf path = STRBUF_INIT;
-		strbuf_addstr(&path, root);
-		strip_last_path_component(&path);
-		strbuf_addstr(&path, "/.scalarCache");
-		return strbuf_detach(&path, NULL);
-	}
+	if (is_unattended())
+		return xstrfmt("%s/.scalarCache", root);
 
 #ifdef WIN32
 	(void)env;
@@ -624,33 +735,27 @@ static char *remote_default_branch(const char *url)
 
 static int delete_enlistment(struct strbuf *enlistment)
 {
+#ifdef WIN32
 	struct strbuf parent = STRBUF_INIT;
-	size_t offset;
-	char *path_sep;
+#endif
 
 	if (unregister_dir())
-		return error(_("failed to unregister repository"));
+		die(_("failed to unregister repository"));
 
+#ifdef WIN32
 	/*
 	 * Change the current directory to one outside of the enlistment so
 	 * that we may delete everything underneath it.
 	 */
-	offset = offset_1st_component(enlistment->buf);
-	path_sep = find_last_dir_sep(enlistment->buf + offset);
-	strbuf_add(&parent, enlistment->buf,
-		   path_sep ? path_sep - enlistment->buf : offset);
-	if (chdir(parent.buf) < 0) {
-		int res = error_errno(_("could not switch to '%s'"), parent.buf);
-		strbuf_release(&parent);
-		return res;
-	}
+	strbuf_addbuf(&parent, enlistment);
+	strbuf_parent_directory(&parent);
+	if (chdir(parent.buf) < 0)
+		die_errno(_("could not switch to '%s'"), parent.buf);
 	strbuf_release(&parent);
-
-	if (have_fsmonitor_support() && stop_fsmonitor_daemon())
-		return error(_("failed to stop the FSMonitor daemon"));
+#endif
 
 	if (remove_dir_recursively(enlistment, 0))
-		return error(_("failed to delete enlistment directory"));
+		die(_("failed to delete enlistment directory"));
 
 	return 0;
 }
@@ -664,52 +769,12 @@ void load_builtin_commands(const char *prefix, struct cmdnames *cmds)
 	die("not implemented");
 }
 
-static int init_shared_object_cache(const char *url,
-				    const char *local_cache_root)
-{
-	struct strbuf buf = STRBUF_INIT;
-	int res = 0;
-	char *cache_key = NULL, *shared_cache_path = NULL;
-
-	if (!(cache_key = get_cache_key(url))) {
-		res = error(_("could not determine cache key for '%s'"), url);
-		goto cleanup;
-	}
-
-	shared_cache_path = xstrfmt("%s/%s", local_cache_root, cache_key);
-	if (set_config("gvfs.sharedCache=%s", shared_cache_path)) {
-		res = error(_("could not configure shared cache"));
-		goto cleanup;
-	}
-
-	strbuf_addf(&buf, "%s/pack", shared_cache_path);
-	switch (safe_create_leading_directories(buf.buf)) {
-	case SCLD_OK: case SCLD_EXISTS:
-		break; /* okay */
-	default:
-		res = error_errno(_("could not initialize '%s'"), buf.buf);
-		goto cleanup;
-	}
-
-	write_file(git_path("objects/info/alternates"),"%s\n", shared_cache_path);
-
-	cleanup:
-	strbuf_release(&buf);
-	free(shared_cache_path);
-	free(cache_key);
-	return res;
-}
-
 static int cmd_clone(int argc, const char **argv)
 {
-	int dummy = 0;
 	const char *branch = NULL;
-	int full_clone = 0, single_branch = 0, show_progress = isatty(2);
-	int src = 1;
+	int full_clone = 0, single_branch = 0, dummy = 0;
 	const char *cache_server_url = NULL, *local_cache_root = NULL;
 	char *default_cache_server_url = NULL, *local_cache_root_abs = NULL;
-	int gvfs_protocol = -1;
-
 	struct option clone_options[] = {
 		OPT_STRING('b', "branch", &branch, N_("<branch>"),
 			   N_("branch to checkout after clone")),
@@ -718,10 +783,6 @@ static int cmd_clone(int argc, const char **argv)
 		OPT_BOOL(0, "single-branch", &single_branch,
 			 N_("only download metadata for the branch that will "
 			    "be checked out")),
-		OPT_BOOL(0, "src", &src,
-			 N_("create repository within 'src' directory")),
-		OPT_BOOL(0, "gvfs-protocol", &gvfs_protocol,
-			 N_("force enable (or disable) the GVFS Protocol")),
 		OPT_STRING(0, "cache-server-url", &cache_server_url,
 			   N_("<url>"),
 			   N_("the url or friendly name of the cache server")),
@@ -733,14 +794,15 @@ static int cmd_clone(int argc, const char **argv)
 		OPT_END(),
 	};
 	const char * const clone_usage[] = {
-		N_("scalar clone [--single-branch] [--branch <main-branch>] [--full-clone]\n"
-		   "\t[--[no-]src] <url> [<enlistment>]"),
+		N_("scalar clone [<options>] [--] <repo> [<dir>]"),
 		NULL
 	};
 	const char *url;
 	char *enlistment = NULL, *dir = NULL;
+	char *cache_key = NULL, *shared_cache_path = NULL;
 	struct strbuf buf = STRBUF_INIT;
 	int res;
+	int gvfs_protocol;
 
 	argc = parse_options(argc, argv, NULL, clone_options, clone_usage, 0);
 
@@ -772,10 +834,7 @@ static int cmd_clone(int argc, const char **argv)
 
 	ensure_absolute_path(enlistment, &enlistment);
 
-	if (src)
-		dir = xstrfmt("%s/src", enlistment);
-	else
-		dir = xstrdup(enlistment);
+	dir = xstrfmt("%s/src", enlistment);
 
 	if (!local_cache_root)
 		local_cache_root = local_cache_root_abs =
@@ -834,6 +893,29 @@ static int cmd_clone(int argc, const char **argv)
 		goto cleanup;
 	}
 
+	if (!(cache_key = get_cache_key(url))) {
+		res = error(_("could not determine cache key for '%s'"), url);
+		goto cleanup;
+	}
+
+	shared_cache_path = xstrfmt("%s/%s", local_cache_root, cache_key);
+	if (set_config("gvfs.sharedCache=%s", shared_cache_path)) {
+		res = error(_("could not configure shared cache"));
+		goto cleanup;
+	}
+
+	strbuf_reset(&buf);
+	strbuf_addf(&buf, "%s/pack", shared_cache_path);
+	switch (safe_create_leading_directories(buf.buf)) {
+	case SCLD_OK: case SCLD_EXISTS:
+		break; /* okay */
+	default:
+		res = error_errno(_("could not initialize '%s'"), buf.buf);
+		goto cleanup;
+	}
+
+	write_file(git_path("objects/info/alternates"),"%s\n", shared_cache_path);
+
 	if (set_config("remote.origin.url=%s", url) ||
 	    set_config("remote.origin.fetch="
 		       "+refs/heads/%s:refs/remotes/origin/%s",
@@ -848,22 +930,10 @@ static int cmd_clone(int argc, const char **argv)
 		goto cleanup;
 	}
 
-	/* Is --[no-]gvfs-protocol unspecified? Infer from url. */
-	if (gvfs_protocol < 0) {
-		if (cache_server_url ||
-		    strstr(url, "dev.azure.com") ||
-		    strstr(url, "visualstudio.com"))
-			gvfs_protocol = 1;
-		else
-			gvfs_protocol = 0;
-	}
-
-	if (gvfs_protocol && !supports_gvfs_protocol(url, &default_cache_server_url))
-		die(_("failed to contact server via GVFS Protocol"));
+	gvfs_protocol = cache_server_url ||
+			supports_gvfs_protocol(url, &default_cache_server_url);
 
 	if (gvfs_protocol) {
-		if ((res = init_shared_object_cache(url, local_cache_root)))
-			goto cleanup;
 		if (!cache_server_url)
 			cache_server_url = default_cache_server_url;
 		if (set_config("core.useGVFSHelper=true") ||
@@ -897,9 +967,7 @@ static int cmd_clone(int argc, const char **argv)
 	if (set_recommended_config(0))
 		return error(_("could not configure '%s'"), dir);
 
-	if ((res = run_git("fetch", "--quiet",
-				show_progress ? "--progress" : "--no-progress",
-				"origin", NULL))) {
+	if ((res = run_git("fetch", "--quiet", "origin", NULL))) {
 		if (gvfs_protocol) {
 			res = error(_("failed to prefetch commits and trees"));
 			goto cleanup;
@@ -913,9 +981,7 @@ static int cmd_clone(int argc, const char **argv)
 			goto cleanup;
 		}
 
-		if ((res = run_git("fetch", "--quiet",
-					show_progress ? "--progress" : "--no-progress",
-					"origin", NULL)))
+		if ((res = run_git("fetch", "--quiet", "origin", NULL)))
 			goto cleanup;
 	}
 
@@ -939,7 +1005,119 @@ cleanup:
 	strbuf_release(&buf);
 	free(default_cache_server_url);
 	free(local_cache_root_abs);
+	free(cache_key);
+	free(shared_cache_path);
 	return res;
+}
+
+static void dir_file_stats_objects(const char *full_path, size_t full_path_len,
+				   const char *file_name, void *data)
+{
+	struct strbuf *buf = data;
+	struct stat st;
+
+	if (!stat(full_path, &st))
+		strbuf_addf(buf, "%-70s %16" PRIuMAX "\n", file_name,
+			    (uintmax_t)st.st_size);
+}
+
+static int dir_file_stats(struct object_directory *object_dir, void *data)
+{
+	struct strbuf *buf = data;
+
+	strbuf_addf(buf, "Contents of %s:\n", object_dir->path);
+
+	for_each_file_in_pack_dir(object_dir->path, dir_file_stats_objects,
+				  data);
+
+	return 0;
+}
+
+static void dir_stats(struct strbuf *buf, const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *e;
+	struct stat e_stat;
+	struct strbuf file_path = STRBUF_INIT;
+	size_t base_path_len;
+
+	if (!dir)
+		return;
+
+	strbuf_addstr(buf, "Contents of ");
+	strbuf_add_absolute_path(buf, path);
+	strbuf_addstr(buf, ":\n");
+
+	strbuf_add_absolute_path(&file_path, path);
+	strbuf_addch(&file_path, '/');
+	base_path_len = file_path.len;
+
+	while ((e = readdir(dir)) != NULL)
+		if (!is_dot_or_dotdot(e->d_name) && e->d_type == DT_REG) {
+			strbuf_setlen(&file_path, base_path_len);
+			strbuf_addstr(&file_path, e->d_name);
+			if (!stat(file_path.buf, &e_stat))
+				strbuf_addf(buf, "%-70s %16"PRIuMAX"\n",
+					    e->d_name,
+					    (uintmax_t)e_stat.st_size);
+		}
+
+	strbuf_release(&file_path);
+	closedir(dir);
+}
+
+static int count_files(char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *e;
+	int count = 0;
+
+	if (!dir)
+		return 0;
+
+	while ((e = readdir(dir)) != NULL)
+		if (!is_dot_or_dotdot(e->d_name) && e->d_type == DT_REG)
+			count++;
+
+	closedir(dir);
+	return count;
+}
+
+static void loose_objs_stats(struct strbuf *buf, const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *e;
+	int count;
+	int total = 0;
+	unsigned char c;
+	struct strbuf count_path = STRBUF_INIT;
+	size_t base_path_len;
+
+	if (!dir)
+		return;
+
+	strbuf_addstr(buf, "Object directory stats for ");
+	strbuf_add_absolute_path(buf, path);
+	strbuf_addstr(buf, ":\n");
+
+	strbuf_add_absolute_path(&count_path, path);
+	strbuf_addch(&count_path, '/');
+	base_path_len = count_path.len;
+
+	while ((e = readdir(dir)) != NULL)
+		if (!is_dot_or_dotdot(e->d_name) &&
+		    e->d_type == DT_DIR && strlen(e->d_name) == 2 &&
+		    !hex_to_bytes(&c, e->d_name, 1)) {
+			strbuf_setlen(&count_path, base_path_len);
+			strbuf_addstr(&count_path, e->d_name);
+			total += (count = count_files(count_path.buf));
+			strbuf_addf(buf, "%s : %7d files\n", e->d_name, count);
+		}
+
+	strbuf_addf(buf, "Total: %d loose objects", total);
+
+	strbuf_release(&count_path);
+	closedir(dir);
 }
 
 static int cmd_diagnose(int argc, const char **argv)
@@ -951,25 +1129,157 @@ static int cmd_diagnose(int argc, const char **argv)
 		N_("scalar diagnose [<enlistment>]"),
 		NULL
 	};
-	struct strbuf diagnostics_root = STRBUF_INIT;
+	struct strbuf zip_path = STRBUF_INIT;
+	struct strvec archiver_args = STRVEC_INIT;
+	char **argv_copy = NULL;
+	int stdout_fd = -1, archiver_fd = -1;
+	time_t now = time(NULL);
+	struct tm tm;
+	struct strbuf path = STRBUF_INIT, buf = STRBUF_INIT;
+	char *cache_server_url = NULL, *shared_cache = NULL;
 	int res = 0;
 
 	argc = parse_options(argc, argv, NULL, options,
 			     usage, 0);
 
-	setup_enlistment_directory(argc, argv, usage, options, &diagnostics_root);
-	strbuf_addstr(&diagnostics_root, "/.scalarDiagnostics");
+	setup_enlistment_directory(argc, argv, usage, options, &zip_path);
 
-	/* Here, a failure should not repeat itself. */
-	git_retries = 1;
-	res = run_git("diagnose", "--mode=all", "-s", "%Y%m%d_%H%M%S",
-		      "-o", diagnostics_root.buf, NULL);
+	strbuf_addstr(&zip_path, "/.scalarDiagnostics/scalar_");
+	strbuf_addftime(&zip_path,
+			"%Y%m%d_%H%M%S", localtime_r(&now, &tm), 0, 0);
+	strbuf_addstr(&zip_path, ".zip");
+	switch (safe_create_leading_directories(zip_path.buf)) {
+	case SCLD_EXISTS:
+	case SCLD_OK:
+		break;
+	default:
+		error_errno(_("could not create directory for '%s'"),
+			    zip_path.buf);
+		goto diagnose_cleanup;
+	}
+	stdout_fd = dup(1);
+	if (stdout_fd < 0) {
+		res = error_errno(_("could not duplicate stdout"));
+		goto diagnose_cleanup;
+	}
 
-	strbuf_release(&diagnostics_root);
+	archiver_fd = xopen(zip_path.buf, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+	if (archiver_fd < 0 || dup2(archiver_fd, 1) < 0) {
+		res = error_errno(_("could not redirect output"));
+		goto diagnose_cleanup;
+	}
+
+	init_zip_archiver();
+	strvec_pushl(&archiver_args, "scalar-diagnose", "--format=zip", NULL);
+
+	strbuf_reset(&buf);
+	strbuf_addstr(&buf, "Collecting diagnostic info\n\n");
+	get_version_info(&buf, 1);
+
+	strbuf_addf(&buf, "Enlistment root: %s\n", the_repository->worktree);
+
+	git_config_get_string("gvfs.cache-server", &cache_server_url);
+	git_config_get_string("gvfs.sharedCache", &shared_cache);
+	strbuf_addf(&buf, "Cache Server: %s\nLocal Cache: %s\n\n",
+		    cache_server_url ? cache_server_url : "None",
+		    shared_cache ? shared_cache : "None");
+	get_disk_info(&buf);
+	write_or_die(stdout_fd, buf.buf, buf.len);
+	strvec_pushf(&archiver_args,
+		     "--add-virtual-file=diagnostics.log:%.*s",
+		     (int)buf.len, buf.buf);
+
+	strbuf_reset(&buf);
+	strbuf_addstr(&buf, "--add-virtual-file=packs-local.txt:");
+	dir_file_stats(the_repository->objects->odb, &buf);
+	foreach_alt_odb(dir_file_stats, &buf);
+	strvec_push(&archiver_args, buf.buf);
+
+	strbuf_reset(&buf);
+	strbuf_addstr(&buf, "--add-virtual-file=objects-local.txt:");
+	loose_objs_stats(&buf, ".git/objects");
+	strvec_push(&archiver_args, buf.buf);
+
+	if ((res = add_directory_to_archiver(&archiver_args, ".git", 0)) ||
+	    (res = add_directory_to_archiver(&archiver_args, ".git/hooks", 0)) ||
+	    (res = add_directory_to_archiver(&archiver_args, ".git/info", 0)) ||
+	    (res = add_directory_to_archiver(&archiver_args, ".git/logs", 1)) ||
+	    (res = add_directory_to_archiver(&archiver_args, ".git/objects/info", 0)))
+		goto diagnose_cleanup;
+
+	if (shared_cache) {
+		strbuf_reset(&buf);
+		strbuf_addf(&path, "%s/pack", shared_cache);
+		strbuf_reset(&buf);
+		strbuf_addstr(&buf, "--add-virtual-file=packs-cached.txt:");
+		dir_stats(&buf, path.buf);
+		strvec_push(&archiver_args, buf.buf);
+
+		strbuf_reset(&buf);
+		strbuf_addstr(&buf, "--add-virtual-file=objects-cached.txt:");
+		loose_objs_stats(&buf, shared_cache);
+		strvec_push(&archiver_args, buf.buf);
+
+		strbuf_reset(&path);
+		strbuf_addf(&path, "%s/info", shared_cache);
+		if (is_directory(path.buf)) {
+			DIR *dir = opendir(path.buf);
+			struct dirent *e;
+
+			while ((e = readdir(dir))) {
+				if (!strcmp(".", e->d_name) || !strcmp("..", e->d_name))
+					continue;
+
+				strbuf_reset(&buf);
+				strbuf_addf(&buf, "--add-virtual-file=info/%s:", e->d_name);
+				if (strbuf_read_file(&buf, path.buf, 0) < 0)
+					goto diagnose_cleanup;
+				strvec_push(&archiver_args, buf.buf);
+			}
+			closedir(dir);
+		}
+	}
+
+	strvec_pushl(&archiver_args, "--prefix=",
+		     oid_to_hex(the_hash_algo->empty_tree), "--", NULL);
+
+	/* `write_archive()` modifies the `argv` passed to it. Let it. */
+	argv_copy = xmemdupz(archiver_args.v,
+			     sizeof(char *) * archiver_args.nr);
+	res = write_archive(archiver_args.nr, (const char **)argv_copy, NULL,
+			    the_repository, NULL, 0);
+	if (res) {
+		error(_("failed to write archive"));
+		goto diagnose_cleanup;
+	}
+
+	if (!res) {
+		strbuf_reset(&buf);
+		strbuf_addf(&buf, "\n"
+			    "Diagnostics complete.\n"
+			    "All of the gathered info is captured in '%s'\n",
+			    zip_path.buf);
+		write_or_die(stdout_fd, buf.buf, buf.len);
+		write_or_die(2, buf.buf, buf.len);
+	}
+
+diagnose_cleanup:
+	if (archiver_fd >= 0) {
+		close(1);
+		dup2(stdout_fd, 1);
+	}
+	free(argv_copy);
+	strvec_clear(&archiver_args);
+	strbuf_release(&zip_path);
+	strbuf_release(&path);
+	strbuf_release(&buf);
+	free(cache_server_url);
+	free(shared_cache);
+
 	return res;
 }
 
-static int cmd_list(int argc, const char **argv UNUSED)
+static int cmd_list(int argc, const char **argv)
 {
 	if (argc != 1)
 		die(_("`scalar list` does not take arguments"));
@@ -997,9 +1307,7 @@ static int cmd_register(int argc, const char **argv)
 	return register_dir();
 }
 
-static int get_scalar_repos(const char *key, const char *value,
-			    const struct config_context *ctx UNUSED,
-			    void *data)
+static int get_scalar_repos(const char *key, const char *value, void *data)
 {
 	struct string_list *list = data;
 
@@ -1007,24 +1315,6 @@ static int get_scalar_repos(const char *key, const char *value,
 		string_list_append(list, value);
 
 	return 0;
-}
-
-static int remove_deleted_enlistment(struct strbuf *path)
-{
-	int res = 0;
-	strbuf_realpath_forgiving(path, path->buf, 1);
-
-	if (run_git("config", "--global",
-		    "--unset", "--fixed-value",
-		    "scalar.repo", path->buf, NULL) < 0)
-		res = -1;
-
-	if (run_git("config", "--global",
-		    "--unset", "--fixed-value",
-		    "maintenance.repo", path->buf, NULL) < 0)
-		res = -1;
-
-	return res;
 }
 
 static int cmd_reconfigure(int argc, const char **argv)
@@ -1041,6 +1331,7 @@ static int cmd_reconfigure(int argc, const char **argv)
 	};
 	struct string_list scalar_repos = STRING_LIST_INIT_DUP;
 	int i, res = 0;
+	struct repository r = { NULL };
 	struct strbuf commondir = STRBUF_INIT, gitdir = STRBUF_INIT;
 
 	argc = parse_options(argc, argv, NULL, options,
@@ -1059,70 +1350,45 @@ static int cmd_reconfigure(int argc, const char **argv)
 	git_config(get_scalar_repos, &scalar_repos);
 
 	for (i = 0; i < scalar_repos.nr; i++) {
-		int succeeded = 0;
-		struct repository *old_repo, r = { NULL };
+		int failed = 0;
 		const char *dir = scalar_repos.items[i].string;
 
 		strbuf_reset(&commondir);
 		strbuf_reset(&gitdir);
 
 		if (chdir(dir) < 0) {
-			struct strbuf buf = STRBUF_INIT;
-
-			if (errno != ENOENT) {
-				warning_errno(_("could not switch to '%s'"), dir);
-				goto loop_end;
-			}
-
-			strbuf_addstr(&buf, dir);
-			if (remove_deleted_enlistment(&buf))
-				error(_("could not remove stale "
-					"scalar.repo '%s'"), dir);
-			else {
-				warning(_("removed stale scalar.repo '%s'"),
-					dir);
-				succeeded = 1;
-			}
-			strbuf_release(&buf);
+			warning_errno(_("could not switch to '%s'"), dir);
+			failed = -1;
 			goto loop_end;
 		}
 
 		switch (discover_git_directory_reason(&commondir, &gitdir)) {
 		case GIT_DIR_INVALID_OWNERSHIP:
 			warning(_("repository at '%s' has different owner"), dir);
-			goto loop_end;
-
-		case GIT_DIR_INVALID_GITFILE:
-		case GIT_DIR_INVALID_FORMAT:
-			warning(_("repository at '%s' has a format issue"), dir);
+			failed = -1;
 			goto loop_end;
 
 		case GIT_DIR_DISCOVERED:
-			succeeded = 1;
 			break;
 
 		default:
 			warning(_("repository not found in '%s'"), dir);
+			failed = -1;
 			break;
 		}
 
 		git_config_clear();
 
-		if (repo_init(&r, gitdir.buf, commondir.buf))
-			goto loop_end;
-
-		old_repo = the_repository;
 		the_repository = &r;
+		r.commondir = commondir.buf;
+		r.gitdir = gitdir.buf;
 
-		if (set_recommended_config(1) >= 0 &&
-		    toggle_maintenance(1) >= 0)
-			succeeded = 1;
-
-		the_repository = old_repo;
+		if (set_recommended_config(1) < 0)
+			failed = -1;
 
 loop_end:
-		if (!succeeded) {
-			res = -1;
+		if (failed) {
+			res = failed;
 			warning(_("to unregister this repository from Scalar, run\n"
 				  "\tgit config --global --unset --fixed-value scalar.repo \"%s\""),
 				dir);
@@ -1197,6 +1463,24 @@ static int cmd_run(int argc, const char **argv)
 			    "--task", tasks[i].task, NULL))
 			return -1;
 	return 0;
+}
+
+static int remove_deleted_enlistment(struct strbuf *path)
+{
+	int res = 0;
+	strbuf_realpath_forgiving(path, path->buf, 1);
+
+	if (run_git("config", "--global",
+		    "--unset", "--fixed-value",
+		    "scalar.repo", path->buf, NULL) < 0)
+		res = -1;
+
+	if (run_git("config", "--global",
+		    "--unset", "--fixed-value",
+		    "maintenance.repo", path->buf, NULL) < 0)
+		res = -1;
+
+	return res;
 }
 
 static int cmd_unregister(int argc, const char **argv)
@@ -1284,7 +1568,7 @@ static int cmd_help(int argc, const char **argv)
 		OPT_END(),
 	};
 	const char * const usage[] = {
-		"scalar help",
+		N_("scalar help"),
 		NULL
 	};
 
@@ -1328,19 +1612,21 @@ static int cmd_version(int argc, const char **argv)
 static int cmd_cache_server(int argc, const char **argv)
 {
 	int get = 0;
-	const char *set = NULL, *list = NULL;
+	char *set = NULL, *list = NULL;
+	const char *default_remote = "(default)";
 	struct option options[] = {
-		OPT_CMDMODE(0, "get", &get,
-			    N_("get the configured cache-server URL"), 1),
+		OPT_BOOL(0, "get", &get,
+			 N_("get the configured cache-server URL")),
 		OPT_STRING(0, "set", &set, N_("URL"),
-			   N_("configure the cache-server to use")),
-		OPT_STRING(0, "list", &list, N_("remote"),
-			   N_("list the possible cache-server URLs")),
+			    N_("configure the cache-server to use")),
+		{ OPTION_STRING, 0, "list", &list, N_("remote"),
+		  N_("list the possible cache-server URLs"),
+		  PARSE_OPT_OPTARG, NULL, (intptr_t) default_remote },
 		OPT_END(),
 	};
 	const char * const usage[] = {
-		N_("scalar cache-server "
-		   "[--get | --set <url> | --list <remote>] [<enlistment>]"),
+		N_("scalar cache_server "
+		   "[--get | --set <url> | --list [<remote>]] [<enlistment>]"),
 		NULL
 	};
 	int res = 0;
@@ -1357,24 +1643,31 @@ static int cmd_cache_server(int argc, const char **argv)
 	if (list) {
 		const char *name = list, *url = list;
 
-		if (!strchr(list, '/')) {
+		if (list == default_remote)
+			list = NULL;
+
+		if (!list || !strchr(list, '/')) {
 			struct remote *remote;
 
 			/* Look up remote */
 			remote = remote_get(list);
 			if (!remote) {
 				error("no such remote: '%s'", name);
+				free(list);
 				return 1;
 			}
-			if (!remote->url.nr) {
+			if (!remote->url) {
+				free(list);
 				return error(_("remote '%s' has no URLs"),
 					     name);
 			}
-			url = remote->url.v[0];
+			url = remote->url[0];
 		}
 		res = supports_gvfs_protocol(url, NULL);
+		free(list);
 	} else if (set) {
 		res = set_config("gvfs.cache-server=%s", set);
+		free(set);
 	} else {
 		char *url = NULL;
 
@@ -1413,7 +1706,7 @@ int cmd_main(int argc, const char **argv)
 	if (is_unattended()) {
 		setenv("GIT_ASKPASS", "", 0);
 		setenv("GIT_TERMINAL_PROMPT", "false", 0);
-		git_config_push_parameter("credential.interactive=false");
+		git_config_push_parameter("credential.interactive=never");
 	}
 
 	while (argc > 1 && *argv[1] == '-') {

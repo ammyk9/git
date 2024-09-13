@@ -452,32 +452,17 @@ You probably do not need to adjust this value.
 Common unit suffixes of 'k', 'm', or 'g' are supported.
 
 core.bigFileThreshold::
-	The size of files considered "big", which as discussed below
-	changes the behavior of numerous git commands, as well as how
-	such files are stored within the repository. The default is
-	512 MiB. Common unit suffixes of 'k', 'm', or 'g' are
-	supported.
+	Files larger than this size are stored deflated, without
+	attempting delta compression.  Storing large files without
+	delta compression avoids excessive memory usage, at the
+	slight expense of increased disk usage. Additionally files
+	larger than this size are always treated as binary.
 +
-Files above the configured limit will be:
+Default is 512 MiB on all platforms.  This should be reasonable
+for most projects as source code and other text files can still
+be delta compressed, but larger binary media files won't be.
 +
-* Stored deflated in packfiles, without attempting delta compression.
-+
-The default limit is primarily set with this use-case in mind. With it,
-most projects will have their source code and other text files delta
-compressed, but not larger binary media files.
-+
-Storing large files without delta compression avoids excessive memory
-usage, at the slight expense of increased disk usage.
-+
-* Will be treated as if they were labeled "binary" (see
-  linkgit:gitattributes[5]). e.g. linkgit:git-log[1] and
-  linkgit:git-diff[1] will not compute diffs for files above this limit.
-+
-* Will generally be streamed when written, which avoids excessive
-memory usage, at the cost of some fixed overhead. Commands that make
-use of this include linkgit:git-archive[1],
-linkgit:git-fast-import[1], linkgit:git-index-pack[1],
-linkgit:git-unpack-objects[1] and linkgit:git-fsck[1].
+Common unit suffixes of 'k', 'm', or 'g' are supported.
 
 core.excludesFile::
 	Specifies the pathname to the file that contains patterns to
@@ -528,7 +513,6 @@ core.editor::
 	`GIT_EDITOR` is not set.  See linkgit:git-var[1].
 
 core.commentChar::
-core.commentString::
 	Commands such as `commit` and `tag` that let you edit
 	messages consider a line that begins with this character
 	commented, and removes them after the editor returns
@@ -536,20 +520,6 @@ core.commentString::
 +
 If set to "auto", `git-commit` would select a character that is not
 the beginning character of any line in existing commit messages.
-+
-Note that these two variables are aliases of each other, and in modern
-versions of Git you are free to use a string (e.g., `//` or `⁑⁕⁑`) with
-`commentChar`. Versions of Git prior to v2.45.0 will ignore
-`commentString` but will reject a value of `commentChar` that consists
-of more than a single ASCII byte. If you plan to use your config with
-older and newer versions of Git, you may want to specify both:
-+
-    [core]
-    # single character for older versions
-    commentChar = "#"
-    # string for newer versions (which will override commentChar
-    # because it comes later in the file)
-    commentString = "//"
 
 core.filesRefLockTimeout::
 	The length of time, in milliseconds, to retry when trying to
@@ -641,7 +611,7 @@ but risks losing recent work in the event of an unclean system shutdown.
 * `loose-object` hardens objects added to the repo in loose-object form.
 * `pack` hardens objects added to the repo in packfile form.
 * `pack-metadata` hardens packfile bitmaps and indexes.
-* `commit-graph` hardens the commit-graph file.
+* `commit-graph` hardens the commit graph file.
 * `index` hardens the index when it is modified.
 * `objects` is an aggregate option that is equivalent to
   `loose-object,pack`.
@@ -724,7 +694,7 @@ core.createObject::
 	will not overwrite existing objects.
 +
 On some file system/operating system combinations, this is unreliable.
-Set this config setting to 'rename' there; however, this will remove the
+Set this config setting to 'rename' there; However, This will remove the
 check that makes sure that existing object files will not get overwritten.
 
 core.notesRef::
@@ -807,8 +777,8 @@ core.sparseCheckout::
 core.sparseCheckoutCone::
 	Enables the "cone mode" of the sparse checkout feature. When the
 	sparse-checkout file contains a limited set of patterns, this
-	mode provides significant performance advantages. The "non-cone
-	mode" can be requested to allow specifying more flexible
+	mode provides significant performance advantages. The "non
+	cone mode" can be requested to allow specifying a more flexible
 	patterns by setting this variable to 'false'. See
 	linkgit:git-sparse-checkout[1] for more information.
 
@@ -821,19 +791,6 @@ core.abbrev::
 	If set to "no", no abbreviation is made and the object names
 	are shown in their full length.
 	The minimum length is 4.
-
-core.maxTreeDepth::
-	The maximum depth Git is willing to recurse while traversing a
-	tree (e.g., "a/b/cde/f" has a depth of 4). This is a fail-safe
-	to allow Git to abort cleanly, and should not generally need to
-	be adjusted. When Git is compiled with MSVC, the default is 512.
-	Otherwise, the default is 2048.
-
-core.WSLCompat::
-	Tells Git whether to enable wsl compatibility mode.
-	The default value is false. When set to true, Git will set the mode
-	bits of the file in the way of wsl, so that the executable flag of
-	files can be set or read correctly.
 
 core.configWriteLockTimeoutMS::
 	When processes try to write to the config concurrently, it is likely

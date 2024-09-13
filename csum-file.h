@@ -1,8 +1,8 @@
 #ifndef CSUM_FILE_H
 #define CSUM_FILE_H
 
+#include "cache.h"
 #include "hash.h"
-#include "write-or-die.h"
 
 struct progress;
 
@@ -21,8 +21,8 @@ struct hashfile {
 	unsigned char *buffer;
 	unsigned char *check_buffer;
 
-	/**
-	 * If non-zero, skip_hash indicates that we should
+	/*
+	 * If set to 1, skip_hash indicates that we should
 	 * not actually compute the hash for this hashfile and
 	 * instead only use it as a buffered write.
 	 */

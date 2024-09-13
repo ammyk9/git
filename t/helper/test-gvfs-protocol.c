@@ -1,20 +1,11 @@
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "environment.h"
-#include "gettext.h"
-#include "hex.h"
-#include "alloc.h"
-#include "setup.h"
-#include "protocol.h"
+#include "cache.h"
 #include "config.h"
 #include "pkt-line.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "string-list.h"
 #include "trace2.h"
-#include "copy.h"
 #include "object.h"
-#include "object-file.h"
 #include "object-store.h"
 #include "replace-object.h"
 #include "repository.h"
@@ -23,8 +14,6 @@
 #include "json-writer.h"
 #include "oidset.h"
 #include "date.h"
-#include "wrapper.h"
-#include "git-zlib.h"
 #include "packfile.h"
 
 #define TR2_CAT "test-gvfs-protocol"
@@ -165,7 +154,7 @@ struct req {
 	.gvfs_api = STRBUF_INIT, \
 	.slash_args = STRBUF_INIT, \
 	.quest_args = STRBUF_INIT, \
-	.header_list = STRING_LIST_INIT_DUP, \
+	.header_list = STRING_LIST_INIT_NODUP, \
 	}
 
 static void req__release(struct req *req)
@@ -545,13 +534,11 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 
 	if (oid_object_info_extended(the_repository, oid, &oi, flags)) {
 		logerror("Could not find OID: '%s'", oid_to_hex(oid));
-		free(content);
 		return send_http_error(1, 404, "Not Found", -1, WR_OK);
 	}
 
 	if (string_list_has_string(&mayhem_list, "http_404")) {
 		logmayhem("http_404");
-		free(content);
 		return send_http_error(1, 404, "Not Found", -1, WR_MAYHEM);
 	}
 
@@ -594,7 +581,6 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 
 	if (write_in_full(fd, response_header.buf, response_header.len) < 0) {
 		logerror("unable to write response header");
-		free(content);
 		return WR_IO_ERROR;
 	}
 
@@ -603,7 +589,6 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 
 	if (string_list_has_string(&mayhem_list, "close_write")) {
 		logmayhem("close_write");
-		free(content);
 		return WR_MAYHEM | WR_HANGUP;
 	}
 
@@ -614,7 +599,6 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 					  (uintmax_t)*oi.sizep);
 
 	/* [2] */
-	memset(&oid_check, 0, sizeof(oid_check));
 	the_hash_algo->init_fn(&c);
 	the_hash_algo->update_fn(&c, object_header, object_header_len);
 	the_hash_algo->update_fn(&c, *oi.contentp, *oi.sizep);
@@ -662,10 +646,8 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 
 		/* [5] */
 		wr = send_chunk(fd, compressed, stream.next_out - compressed);
-		if (wr & WR_STOP_THE_MUSIC) {
-			free(content);
+		if (wr & WR_STOP_THE_MUSIC)
 			return wr;
-		}
 
 		stream.next_out = compressed;
 		stream.avail_out = sizeof(compressed);
@@ -686,7 +668,6 @@ static enum worker_result send_loose_object(const struct object_id *oid,
 		    oid_to_hex(oid), oid_to_hex(&oid_check));
 
 	/* [5] */
-	free(content);
 	return send_final_chunk(fd);
 }
 
@@ -1155,82 +1136,6 @@ static int ct_pack_sort_compare(const void *_a, const void *_b)
 	return (a->ph.timestamp < b->ph.timestamp) ? -1 : (a->ph.timestamp != b->ph.timestamp);
 }
 
-#define MY_MIN(a, b) ((a) < (b) ? (a) : (b))
-
-/*
- * Like copy.c:copy_fd(), but corrupt part of the trailing SHA (if the
- * given mayhem key is defined) as we copy it to the destination file.
- *
- * We don't know (or care) if the input file is a pack file or idx
- * file, just that the final bytes are part of a SHA that we can
- * corrupt.
- */
-static int copy_fd_with_checksum_mayhem(int ifd, int ofd,
-					const char *mayhem_key,
-					ssize_t nr_wrong_bytes)
-{
-	off_t in_cur, in_len;
-	ssize_t bytes_to_copy;
-	ssize_t bytes_remaining_to_copy;
-	char buffer[8192];
-
-	if (!mayhem_key || !*mayhem_key || !nr_wrong_bytes ||
-	    !string_list_has_string(&mayhem_list, mayhem_key))
-		return copy_fd(ifd, ofd);
-
-	in_cur = lseek(ifd, 0, SEEK_CUR);
-	if (in_cur < 0)
-		return in_cur;
-
-	in_len = lseek(ifd, 0, SEEK_END);
-	if (in_len < 0)
-		return in_len;
-
-	if (lseek(ifd, in_cur, SEEK_SET) < 0)
-		return -1;
-
-	/* Copy the entire file except for the last few bytes. */
-
-	bytes_to_copy = (ssize_t)in_len - nr_wrong_bytes;
-	bytes_remaining_to_copy = bytes_to_copy;
-	while (bytes_remaining_to_copy) {
-		ssize_t to_read = MY_MIN(sizeof(buffer), bytes_remaining_to_copy);
-		ssize_t len = xread(ifd, buffer, to_read);
-
-		if (!len)
-			return -1; /* error on unexpected EOF */
-		if (len < 0)
-			return -1;
-		if (write_in_full(ofd, buffer, len) < 0)
-			return -1;
-
-		bytes_remaining_to_copy -= len;
-	}
-
-	/* Read the trailing bytes so that we can alter them before copying. */
-
-	while (nr_wrong_bytes) {
-		ssize_t to_read = MY_MIN(sizeof(buffer), nr_wrong_bytes);
-		ssize_t len = xread(ifd, buffer, to_read);
-		ssize_t k;
-
-		if (!len)
-			return -1; /* error on unexpected EOF */
-		if (len < 0)
-			return -1;
-
-		for (k = 0; k < len; k++)
-			buffer[k] ^= 0xff;
-
-		if (write_in_full(ofd, buffer, len) < 0)
-			return -1;
-
-		nr_wrong_bytes -= len;
-	}
-
-	return 0;
-}
-
 static enum worker_result send_ct_item(const struct ct_pack_item *item)
 {
 	struct ph ph_le;
@@ -1252,8 +1157,7 @@ static enum worker_result send_ct_item(const struct ct_pack_item *item)
 	trace2_printf("%s: sending prefetch pack '%s'", TR2_CAT, item->path_pack.buf);
 
 	fd_pack = git_open_cloexec(item->path_pack.buf, O_RDONLY);
-	if (fd_pack == -1 ||
-	    copy_fd_with_checksum_mayhem(fd_pack, 1, "bad_prefetch_pack_sha", 4)) {
+	if (fd_pack == -1 || copy_fd(fd_pack, 1)) {
 		logerror("could not send packfile");
 		wr = WR_IO_ERROR;
 		goto done;
@@ -1263,8 +1167,7 @@ static enum worker_result send_ct_item(const struct ct_pack_item *item)
 		trace2_printf("%s: sending prefetch idx '%s'", TR2_CAT, item->path_idx.buf);
 
 		fd_idx = git_open_cloexec(item->path_idx.buf, O_RDONLY);
-		if (fd_idx == -1 ||
-		    copy_fd_with_checksum_mayhem(fd_idx, 1, "bad_prefetch_idx_sha", 4)) {
+		if (fd_idx == -1 || copy_fd(fd_idx, 1)) {
 			logerror("could not send idx");
 			wr = WR_IO_ERROR;
 			goto done;
@@ -1526,7 +1429,8 @@ static enum worker_result req__read(struct req *req, int fd)
 		if (!h.len)
 			goto done; /* a blank line ends the header */
 
-		string_list_append(&req->header_list, h.buf);
+		string_list_append(&req->header_list,
+				   strbuf_detach(&h, NULL));
 	}
 
 	/*
@@ -1572,8 +1476,6 @@ done:
 	}
 #endif
 
-	strbuf_release(&h);
-
 	return WR_OK;
 }
 
@@ -1583,14 +1485,6 @@ static enum worker_result dispatch(struct req *req)
 	static int initialized;
 	const char *method;
 	enum worker_result wr;
-
-	if (strstr(req->uri_base.buf, MY_SERVER_TYPE__CACHE)) {
-		if (string_list_has_string(&mayhem_list, "cache_http_503")) {
-			logmayhem("cache_http_503");
-			return send_http_error(1, 503, "Service Unavailable", 2,
-					       WR_MAYHEM | WR_HANGUP);
-		}
-	}
 
 	if (string_list_has_string(&mayhem_list, "close_no_write")) {
 		logmayhem("close_no_write");
@@ -1917,7 +1811,7 @@ static const char *ip2str(int family, struct sockaddr *sin, socklen_t len)
 
 #ifndef NO_IPV6
 
-static int setup_named_sock(const char *listen_addr, int listen_port, struct socketlist *socklist)
+static int setup_named_sock(char *listen_addr, int listen_port, struct socketlist *socklist)
 {
 	int socknum = 0;
 	char pbuf[NI_MAXSERV];
@@ -2177,7 +2071,7 @@ static int serve(struct string_list *listen_addr, int listen_port)
 int cmd_main(int argc, const char **argv)
 {
 	int listen_port = 0;
-	static struct string_list listen_addr = STRING_LIST_INIT_NODUP;
+	struct string_list listen_addr = STRING_LIST_INIT_NODUP;
 	int worker_mode = 0;
 	int i;
 
@@ -2189,7 +2083,7 @@ int cmd_main(int argc, const char **argv)
 		const char *v;
 
 		if (skip_prefix(arg, "--listen=", &v)) {
-			string_list_append_nodup(&listen_addr, xstrdup_tolower(v));
+			string_list_append(&listen_addr, xstrdup_tolower(v));
 			continue;
 		}
 		if (skip_prefix(arg, "--port=", &v)) {

@@ -1680,6 +1680,13 @@ unsigned long get_nr_unpack_entry(void)
 	return g_nr_unpack_entry;
 }
 
+static unsigned long g_nr_unpack_entry;
+
+unsigned long get_nr_unpack_entry(void)
+{
+	return g_nr_unpack_entry;
+}
+
 void *unpack_entry(struct repository *r, struct packed_git *p, off_t obj_offset,
 		   enum object_type *final_type, unsigned long *final_size)
 {

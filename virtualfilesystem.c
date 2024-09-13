@@ -1,14 +1,8 @@
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "environment.h"
-#include "gettext.h"
-#include "trace2.h"
+#include "cache.h"
 #include "config.h"
 #include "dir.h"
 #include "hashmap.h"
 #include "run-command.h"
-#include "name-hash.h"
-#include "read-cache-ll.h"
 #include "virtualfilesystem.h"
 
 #define HOOK_INTERFACE_VERSION	(1)

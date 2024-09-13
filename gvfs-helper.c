@@ -105,11 +105,6 @@
 //                       The GVFS Protocol defines this value as a way to
 //                       request cached packfiles NEWER THAN this timestamp.
 //
-//                 --max-retries=<n>     // defaults to "6"
-//
-//                       Number of retries after transient network errors.
-//                       Set to zero to disable such retries.
-//
 //     server
 //
 //            Interactive/sub-process mode.  Listen for a series of commands
@@ -215,12 +210,7 @@
 //
 //////////////////////////////////////////////////////////////////
 
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "git-curl-compat.h"
-#include "environment.h"
-#include "hex.h"
-#include "setup.h"
+#include "cache.h"
 #include "config.h"
 #include "remote.h"
 #include "connect.h"
@@ -240,17 +230,12 @@
 #include "quote.h"
 #include "transport.h"
 #include "parse-options.h"
-#include "object-file.h"
 #include "object-store.h"
 #include "json-writer.h"
 #include "tempfile.h"
 #include "oidset.h"
 #include "dir.h"
-#include "url.h"
-#include "abspath.h"
 #include "progress.h"
-#include "trace2.h"
-#include "wrapper.h"
 #include "packfile.h"
 #include "date.h"
 
@@ -1333,7 +1318,7 @@ static void lookup_main_url(void)
 		gh__cmd_opts.remote_name = "origin";
 
 	gh__global.remote = remote_get(gh__cmd_opts.remote_name);
-	if (!gh__global.remote->url.v[0] || !*gh__global.remote->url.v[0])
+	if (!gh__global.remote->url[0] || !*gh__global.remote->url[0])
 		die("unknown remote '%s'", gh__cmd_opts.remote_name);
 
 	/*
@@ -1345,7 +1330,7 @@ static void lookup_main_url(void)
 	 *
 	 * Break that so that we can force the use of a PAT.
 	 */
-	gh__global.main_url = transport_anonymize_url(gh__global.remote->url.v[0]);
+	gh__global.main_url = transport_anonymize_url(gh__global.remote->url[0]);
 
 	trace2_data_string(TR2_CAT, NULL, "remote/url", gh__global.main_url);
 }
@@ -1501,7 +1486,6 @@ static unsigned long read_stdin_for_oids(struct oidset *oids)
 			count++;
 	} while (1);
 
-	strbuf_release(&buf_stdin);
 	return count;
 }
 
@@ -1543,7 +1527,7 @@ static unsigned long build_json_payload__gvfs_objects(
 		if (k == 1)
 			oidcpy(oid_out, oid_prev);
 		else
-			oidclr(oid_out, the_repository->hash_algo);
+			oidclr(oid_out);
 	}
 
 	return k;
@@ -1558,7 +1542,7 @@ static void lookup_main_creds(void)
 		return;
 
 	credential_from_url(&gh__global.main_creds, gh__global.main_url);
-	credential_fill(&gh__global.main_creds, 0);
+	credential_fill(&gh__global.main_creds);
 	gh__global.main_creds_need_approval = 1;
 }
 
@@ -1858,11 +1842,13 @@ static void my_run_index_pack(struct gh__request_params *params,
 	strvec_push(&ip.args, "git");
 	strvec_push(&ip.args, "index-pack");
 
-	ip.err = -1;
-	ip.no_stderr = 1;
-
-	/* Skip generating the rev index, we don't need it. */
-	strvec_push(&ip.args, "--no-rev-index");
+	if (gh__cmd_opts.show_progress) {
+		strvec_push(&ip.args, "-v");
+		ip.err = 0;
+	} else {
+		ip.err = -1;
+		ip.no_stderr = 1;
+	}
 
 	strvec_pushl(&ip.args, "-o", temp_path_idx->buf, NULL);
 	strvec_push(&ip.args, temp_path_pack->buf);
@@ -2130,6 +2116,7 @@ static void extract_packfile_from_multipack(
 {
 	struct ph ph;
 	struct tempfile *tempfile_pack = NULL;
+	struct tempfile *tempfile_idx = NULL;
 	int result = -1;
 	int b_no_idx_in_multipack;
 	struct object_id packfile_checksum;
@@ -2163,14 +2150,16 @@ static void extract_packfile_from_multipack(
 	b_no_idx_in_multipack = (ph.idx_len == maximum_unsigned_value_of_type(uint64_t) ||
 				 ph.idx_len == 0);
 
-	/*
-	 * We are going to harden `gvfs-helper` here and ignore the .idx file
-	 * if it is provided and always compute it locally so that we get the
-	 * added verification that `git index-pack` provides.
-	 */
-	my_create_tempfile(status, 0, "pack", &tempfile_pack, NULL, NULL);
-	if (!tempfile_pack)
-		goto done;
+	if (b_no_idx_in_multipack) {
+		my_create_tempfile(status, 0, "pack", &tempfile_pack, NULL, NULL);
+		if (!tempfile_pack)
+			goto done;
+	} else {
+		/* create a pair of tempfiles with the same basename */
+		my_create_tempfile(status, 0, "pack", &tempfile_pack, "idx", &tempfile_idx);
+		if (!tempfile_pack || !tempfile_idx)
+			goto done;
+	}
 
 	/*
 	 * Copy the current packfile from the open stream and capture
@@ -2197,31 +2186,38 @@ static void extract_packfile_from_multipack(
 
 	oid_to_hex_r(hex_checksum, &packfile_checksum);
 
-	/*
-	 * Always compute the .idx file from the .pack file.
-	 */
-	strbuf_addbuf(&temp_path_idx, &temp_path_pack);
-	strbuf_strip_suffix(&temp_path_idx, ".pack");
-	strbuf_addstr(&temp_path_idx, ".idx");
+	if (b_no_idx_in_multipack) {
+		/*
+		 * The server did not send the corresponding .idx, so
+		 * we have to compute it ourselves.
+		 */
+		strbuf_addbuf(&temp_path_idx, &temp_path_pack);
+		strbuf_strip_suffix(&temp_path_idx, ".pack");
+		strbuf_addstr(&temp_path_idx, ".idx");
 
-	my_run_index_pack(params, status,
-			  &temp_path_pack, &temp_path_idx,
-			  NULL);
-	if (status->ec != GH__ERROR_CODE__OK)
-		goto done;
+		my_run_index_pack(params, status,
+				  &temp_path_pack, &temp_path_idx,
+				  NULL);
+		if (status->ec != GH__ERROR_CODE__OK)
+			goto done;
 
-	if (!b_no_idx_in_multipack) {
+	} else {
 		/*
 		 * Server sent the .idx immediately after the .pack in the
-		 * data stream.  Skip over it.
+		 * data stream.  I'm tempted to verify it, but that defeats
+		 * the purpose of having it cached...
 		 */
-		if (lseek(fd_multipack, ph.idx_len, SEEK_CUR) < 0) {
+		if (my_copy_fd_len(fd_multipack, get_tempfile_fd(tempfile_idx),
+				   ph.idx_len) < 0) {
 			strbuf_addf(&status->error_message,
-				    "could not skip index[%d] in multipack",
+				    "could not extract index[%d] in multipack",
 				    k);
 			status->ec = GH__ERROR_CODE__COULD_NOT_INSTALL_PREFETCH;
 			goto done;
 		}
+
+		strbuf_addstr(&temp_path_idx, get_tempfile_path(tempfile_idx));
+		close_tempfile_gently(tempfile_idx);
 	}
 
 	strbuf_addf(&buf_timestamp, "%u", (unsigned int)ph.timestamp);
@@ -2236,6 +2232,7 @@ static void extract_packfile_from_multipack(
 
 done:
 	delete_tempfile(&tempfile_pack);
+	delete_tempfile(&tempfile_idx);
 	strbuf_release(&temp_path_pack);
 	strbuf_release(&temp_path_idx);
 	strbuf_release(&final_path_pack);
@@ -2348,17 +2345,12 @@ static void install_prefetch(struct gh__request_params *params,
 		trace2_data_intmax(TR2_CAT, NULL,
 				   "prefetch/packfile_count", np);
 
-	if (gh__cmd_opts.show_progress)
-		params->progress = start_progress("Installing prefetch packfiles", np);
-
 	for (k = 0; k < np; k++) {
 		extract_packfile_from_multipack(params, status, fd, k);
-		display_progress(params->progress, k + 1);
 		if (status->ec != GH__ERROR_CODE__OK)
 			break;
 		nr_installed++;
 	}
-	stop_progress(&params->progress);
 
 	if (nr_installed)
 		delete_stale_keep_files(params, status);
@@ -2394,7 +2386,6 @@ static int verify_loose_object(const char *path,
 	ret = read_loose_object(path, expected_oid, &real_oid, &contents, &oi);
 	if (!ret)
 		free(contents);
-	strbuf_release(&type_name);
 
 	return ret;
 }
@@ -2952,7 +2943,6 @@ static void do_req(const char *url_base,
 	}
 
 	gh__run_one_slot(slot, params, status);
-	strbuf_release(&rest_url);
 }
 
 /*
@@ -3791,8 +3781,6 @@ static enum gh__error_code do_sub_cmd__prefetch(int argc, const char **argv)
 	static const char *since_str;
 	static struct option prefetch_options[] = {
 		OPT_STRING(0, "since", &since_str, N_("since"), N_("seconds since epoch")),
-		OPT_INTEGER('r', "max-retries", &gh__cmd_opts.max_retries,
-			    N_("retries for transient network errors")),
 		OPT_END(),
 	};
 
@@ -3812,8 +3800,6 @@ static enum gh__error_code do_sub_cmd__prefetch(int argc, const char **argv)
 		if (my_parse_since(since_str, &seconds_since_epoch))
 			die("could not parse 'since' field");
 	}
-	if (gh__cmd_opts.max_retries < 0)
-		gh__cmd_opts.max_retries = 0;
 
 	finish_init(1);
 

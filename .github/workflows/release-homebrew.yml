@@ -6,21 +6,20 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
-    environment: release
     steps:
     - id: version
       name: Compute version number
       run: |
-        echo "result=$(echo $GITHUB_REF | sed -e "s/^refs\/tags\/v//")" >>$GITHUB_OUTPUT
+        echo "::set-output name=result::$(echo $GITHUB_REF | sed -e "s/^refs\/tags\/v//")"
     - id: hash
       name: Compute release asset hash
-      uses: mjcheetham/asset-hash@v1.1
+      uses: mjcheetham/asset-hash@v1
       with:
         asset: /git-(.*)\.pkg/
         hash: sha256
         token: ${{ secrets.GITHUB_TOKEN }}
     - name: Update scalar Cask
-      uses: mjcheetham/update-homebrew@v1.3
+      uses: mjcheetham/update-homebrew@v1.1
       with:
         token: ${{ secrets.HOMEBREW_TOKEN }}
         tap: microsoft/git

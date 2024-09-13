@@ -1,7 +1,4 @@
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "environment.h"
-#include "hex.h"
+#include "cache.h"
 #include "strvec.h"
 #include "trace2.h"
 #include "oidset.h"
@@ -13,8 +10,6 @@
 #include "pkt-line.h"
 #include "quote.h"
 #include "packfile.h"
-#include "hex.h"
-#include "config.h"
 
 static struct oidset gh_client__oidset_queued = OIDSET_INIT;
 static unsigned long gh_client__oidset_count;
@@ -327,7 +322,7 @@ static void gh_client__choose_odb(void)
 		return;
 
 	for (odb = the_repository->objects->odb->next; odb; odb = odb->next) {
-		if (!fspathcmp(odb->path, gvfs_shared_cache_pathname.buf)) {
+		if (!strcmp(odb->path, gvfs_shared_cache_pathname.buf)) {
 			gh_client__chosen_odb = odb;
 			return;
 		}
@@ -340,7 +335,6 @@ static struct gh_server__process *gh_client__find_long_running_process(
 	struct gh_server__process *entry;
 	struct strvec argv = STRVEC_INIT;
 	struct strbuf quoted = STRBUF_INIT;
-	int fallback;
 
 	gh_client__choose_odb();
 
@@ -348,17 +342,10 @@ static struct gh_server__process *gh_client__find_long_running_process(
 	 * TODO decide what defaults we want.
 	 */
 	strvec_push(&argv, "gvfs-helper");
+	strvec_push(&argv, "--fallback");
 	strvec_push(&argv, "--cache-server=trust");
 	strvec_pushf(&argv, "--shared-cache=%s",
 			 gh_client__chosen_odb->path);
-
-	/* If gvfs.fallback=false, then don't add --fallback. */
-	if (!git_config_get_bool("gvfs.fallback", &fallback) &&
-	    !fallback)
-		strvec_push(&argv, "--no-fallback");
-	else
-		strvec_push(&argv, "--fallback");
-
 	strvec_push(&argv, "server");
 
 	sq_quote_argv_pretty(&quoted, argv.v);

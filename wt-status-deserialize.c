@@ -1,15 +1,7 @@
-#define USE_THE_REPOSITORY_VARIABLE
-#include "git-compat-util.h"
-#include "environment.h"
-#include "hex.h"
-#include "hash.h"
+#include "cache.h"
 #include "wt-status.h"
 #include "pkt-line.h"
 #include "trace.h"
-#include "statinfo.h"
-#include "hex.h"
-#include "path.h"
-#include "trace2.h"
 
 static void set_deserialize_reject_reason(const char *reason)
 {
